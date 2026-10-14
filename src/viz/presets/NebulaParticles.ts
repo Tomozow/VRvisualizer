@@ -13,11 +13,23 @@ const DUST_COUNT = 300;
 const COUNTS: Record<QualityLevel, number> = { low: 25_000, medium: 60_000, high: 120_000 };
 
 // Particle classes, chosen by aSeed.w: gas (large soft sprites that build the volume), dust (small coloured
-// grains that trace the filaments) and sparks (tiny near-white points that twinkle with the treble).
+// grains that trace the filaments) and sparks (tiny points that twinkle with the treble).
 const GAS_END = 0.55;
 const SPARK_START = 0.95;
 const ARM_COUNT = 6;
 const HALO_FRACTION = 0.12;
+
+// Particle kinds (aArm.w) layered on top of the classes.
+const KIND_ARM = 0; // arms and halo
+const KIND_HAZE = 1; // low floor haze (gas hugging the floor)
+const KIND_KNOT = 2; // the dense hero knot straight ahead
+const KIND_HERO = 3; // rare large sparks with a 4-point flare
+const HAZE_FRACTION = 0.08;
+const KNOT_FRACTION = 0.08;
+const KNOT_SIGMA = 0.9;
+const KNOT_CENTER = new THREE.Vector3(0, 1.8 - EYE, -7); // relative to the head
+const HERO_SHARE = 0.35; // of the spark class => ~1.5 % of all particles
+const DEFAULT_SEED = 0x4e45424c;
 
 // ---------------------------------------------------------------------------------------------
 // Init-time structure (CPU). The nebula is stateless on the GPU, but its "home" positions are laid
@@ -48,9 +60,36 @@ function smooth(a: number, b: number, x: number): number {
   return t * t * (3 - 2 * t);
 }
 
-const rand = (a: number, b: number) => a + (b - a) * Math.random();
-/** Roughly normal (sum of three uniforms), unit variance. */
-const gauss = () => ((Math.random() + Math.random() + Math.random()) / 3 - 0.5) * 6;
+/** Deterministic random source: the layout only depends on `?seed=` (or a fixed default), never on Math.random. */
+interface Rng {
+  next(): number;
+  range(a: number, b: number): number;
+  /** Roughly normal (sum of three uniforms), unit variance. */
+  gauss(): number;
+}
+
+function makeRng(seed: number): Rng {
+  let a = seed | 0;
+  const next = () => {
+    a = (a + 0x6d2b79f5) | 0; // mulberry32
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  return {
+    next,
+    range: (lo, hi) => lo + (hi - lo) * next(),
+    gauss: () => ((next() + next() + next()) / 3 - 0.5) * 6,
+  };
+}
+
+function layoutSeed(): number {
+  const raw = typeof location === 'undefined' ? null : new URLSearchParams(location.search).get('seed');
+  if (raw === null) return DEFAULT_SEED;
+  let h = 2166136261; // FNV-1a over the raw string so "7" and "07" differ but both are stable
+  for (let i = 0; i < raw.length; i++) h = Math.imul(h ^ raw.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
 
 /** A curved stream wrapped around the listener: a (tilted) circle with a spiralling radius and a wobble. */
 interface Arm {
@@ -69,32 +108,33 @@ interface Arm {
   omega: number; // orbital drift, rad/s around the vertical axis
 }
 
-function makeArms(): Arm[] {
+function makeArms(rng: Rng): Arm[] {
+  const { next, range } = rng;
   const arms: Arm[] = [];
   for (let i = 0; i < ARM_COUNT; i++) {
-    // half of the arms are flat-ish spirals around eye height, the others are tilted toroidal streams
+    // half of the arms are flat-ish spirals raised above eye height, the others are steeply tilted streams that reach the zenith and the floor
     const flat = i % 2 === 0;
-    const tilt = flat ? rand(-0.12, 0.22) : (Math.random() < 0.5 ? -1 : 1) * rand(0.4, 0.8);
-    const roll = rand(0, TAU);
+    const tilt = flat ? range(-0.12, 0.22) : (next() < 0.5 ? -1 : 1) * range(0.5, 0.95);
+    const roll = range(0, TAU);
     const n = new THREE.Vector3(Math.sin(tilt) * Math.cos(roll), Math.cos(tilt), Math.sin(tilt) * Math.sin(roll));
     const a = new THREE.Vector3().crossVectors(n, new THREE.Vector3(0, 0, -1)).normalize();
     const b = new THREE.Vector3().crossVectors(n, a);
-    let r0 = rand(R_MIN + 0.3, R_MAX - 2);
-    let r1 = rand(R_MIN + 0.3, R_MAX);
+    let r0 = range(R_MIN + 0.3, R_MAX - 2);
+    let r1 = range(R_MIN + 0.3, R_MAX);
     if (Math.abs(r1 - r0) < 2.5) r1 = r0 < 7 ? r0 + 3 : r0 - 3;
     r0 = Math.min(R_MAX, Math.max(R_MIN, r0));
     r1 = Math.min(R_MAX, Math.max(R_MIN, r1));
     arms.push({
       a, b, n,
-      centerY: flat ? rand(-0.2, 0.8) : rand(0.8, 2.0),
+      centerY: flat ? range(0.5, 2.5) : range(0.8, 2.0),
       r0, r1,
-      phi0: rand(0, TAU),
-      span: rand(1.2, 2) * Math.PI,
-      dir: Math.random() < 0.5 ? -1 : 1,
-      wobAmp: rand(0.08, 0.3),
-      wobK: rand(1.3, 3.2),
-      wobP: rand(0, TAU),
-      omega: (Math.random() < 0.5 ? -1 : 1) * rand(0.05, 0.2),
+      phi0: range(0, TAU),
+      span: range(1.2, 2) * Math.PI,
+      dir: next() < 0.5 ? -1 : 1,
+      wobAmp: range(0.08, 0.3),
+      wobK: range(1.3, 3.2),
+      wobP: range(0, TAU),
+      omega: (next() < 0.5 ? -1 : 1) * range(0.05, 0.2),
     });
   }
   return arms;
@@ -114,6 +154,109 @@ function armPoint(arm: Arm, u: number, out: THREE.Vector3): THREE.Vector3 {
   out.multiplyScalar(r);
   out.y += arm.centerY;
   return out;
+}
+
+interface Layout {
+  /** home offsets from the head */
+  home: Float32Array;
+  /** (band, phase, size, class) */
+  seed: Float32Array;
+  /** (drift rad/s, arm hue, random, kind) */
+  arm: Float32Array;
+}
+
+/**
+ * Lays out `count` particles: a guaranteed dense hero knot straight ahead, a low floor haze, and the arms / halo
+ * that fill the rest. Fully determined by `rng`, so the composition is reproducible.
+ */
+function buildLayout(count: number, rng: Rng): Layout {
+  const { next, range, gauss } = rng;
+  const arms = makeArms(rng);
+  const home = new Float32Array(count * 3);
+  const seed = new Float32Array(count * 4);
+  const armData = new Float32Array(count * 4);
+  const knotCount = Math.round(count * KNOT_FRACTION);
+  const hazeCount = Math.round(count * HAZE_FRACTION);
+  const pt = new THREE.Vector3();
+  for (let i = 0; i < count; ) {
+    const knot = i < knotCount;
+    const haze = !knot && i < knotCount + hazeCount;
+    let cls = next();
+    let kind = KIND_ARM;
+    let band: number;
+    let omega: number;
+    let hue: number;
+    if (knot) {
+      // mostly fine dust and sparks with a little gas so the focal point reads as a bright, grainy cluster
+      const u = next();
+      cls = u < 0.1 ? range(0, GAS_END) : u < 0.94 ? range(GAS_END, SPARK_START) : range(SPARK_START, 1);
+      pt.set(gauss() * KNOT_SIGMA, gauss() * KNOT_SIGMA, gauss() * KNOT_SIGMA).add(KNOT_CENTER);
+      const n = valueNoise(pt.x * 0.9, pt.y * 0.9, pt.z * 0.9);
+      if (next() > 0.45 + 0.55 * smooth(0.25, 0.7, n)) continue; // ragged edges and voids inside the knot
+      kind = KIND_KNOT;
+      band = next();
+      omega = 0; // the knot never orbits away from the focal spot
+      hue = next();
+    } else if (haze) {
+      // gas lying on the floor (0..1.2 m above it), uniform over the floor area
+      cls = range(0, GAS_END);
+      const r = Math.sqrt(range(4 * 4, (R_MAX + 1) * (R_MAX + 1)));
+      const phi = next() * TAU;
+      pt.set(r * Math.sin(phi), range(0, 1.2) - EYE, -r * Math.cos(phi));
+      kind = KIND_HAZE;
+      band = next();
+      omega = (next() < 0.5 ? -1 : 1) * range(0.01, 0.04);
+      hue = 0.5;
+    } else if (next() < HALO_FRACTION) {
+      // sparse halo: bell-shaped elevation, denser in front
+      let phi = next() * TAU;
+      phi -= 0.4 * Math.sin(phi);
+      const el = ((next() + next() + next()) / 3 * 2 - 1) * 1.1;
+      const r = R_MIN + 1 + (R_MAX + 2 - R_MIN - 1) * Math.pow(next(), 0.8);
+      const ce = Math.cos(el);
+      pt.set(r * ce * Math.sin(phi), r * Math.sin(el), -r * ce * Math.cos(phi));
+      band = next();
+      omega = (next() < 0.5 ? -1 : 1) * range(0.01, 0.04);
+      hue = 0.5;
+    } else {
+      const gas = cls < GAS_END;
+      const spark = cls >= SPARK_START;
+      const ai = Math.floor(next() * ARM_COUNT);
+      const arm = arms[ai];
+      const u = next();
+      if (next() > Math.pow(Math.sin(Math.PI * u), 0.6)) continue; // taper toward both ends
+      armPoint(arm, u, pt);
+      // cross-section: wide for gas, tight for the dust that traces the filament, pinching and swelling along the arm
+      const pinch = 0.6 + 0.8 * valueNoise(u * 5 + ai * 7.3, ai * 3.1, 1.7);
+      const sigma = (gas ? range(0.8, 1.3) : spark ? 0.7 : range(0.25, 0.5)) * pinch;
+      pt.x += gauss() * sigma;
+      pt.y += gauss() * sigma * 0.8;
+      pt.z += gauss() * sigma;
+      band = (ai + u) / ARM_COUNT;
+      omega = arm.omega;
+      hue = ai / (ARM_COUNT - 1);
+    }
+    if (kind === KIND_ARM) {
+      // nothing below the floor or on top of the head; thin out smoothly toward the floor
+      if (EYE + pt.y < 0.3 || pt.length() < 2 || next() > smooth(0.3, 1.8, EYE + pt.y)) continue;
+      const n = 0.65 * valueNoise(pt.x * 0.2, pt.y * 0.2, pt.z * 0.2) + 0.35 * valueNoise(pt.x * 0.47 + 7.1, pt.y * 0.47, pt.z * 0.47 + 3.7);
+      if (next() > 0.35 + 0.65 * smooth(0.3, 0.7, n)) continue; // extra clumping: voids inside the arms
+      if (cls >= SPARK_START && next() < HERO_SHARE) kind = KIND_HERO;
+    }
+    home[i * 3] = pt.x;
+    home[i * 3 + 1] = pt.y;
+    home[i * 3 + 2] = pt.z;
+    seed[i * 4] = Math.min(0.98, Math.max(0.02, band + range(-0.04, 0.04)));
+    seed[i * 4 + 1] = next();
+    seed[i * 4 + 2] = next();
+    seed[i * 4 + 3] = cls;
+    armData[i * 4] = omega;
+    armData[i * 4 + 1] = hue;
+    armData[i * 4 + 2] = next();
+    armData[i * 4 + 3] = kind;
+    i++;
+  }
+  return { home, seed, arm: armData };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -144,19 +287,26 @@ ${NOISE_GLSL}
 #define R_RANGE ${(R_MAX - R_MIN).toFixed(1)}
 #define GAS_END ${GAS_END.toFixed(2)}
 #define SPARK_START ${SPARK_START.toFixed(2)}
-#define GAS_GAIN 0.3
+#define GAS_GAIN 0.24
 #define DUST_GAIN 0.2
-// position = home offset from the head. aSeed = (band, phase, size, class), aArm = (drift rad/s, arm hue, random)
+#define GAS_MAX_PX 40.0
+#define SPRITE_MAX_PX 56.0
+// position = home offset from the head. aSeed = (band, phase, size, class), aArm = (drift rad/s, arm hue, random, kind)
+// kind: 0 arm / halo, 1 floor haze, 2 hero knot, 3 hero spark
 attribute vec4 aSeed;
-attribute vec3 aArm;
+attribute vec4 aArm;
 uniform sampler2D uGradient;
 uniform float uTime, uSwirl, uDrift, uBass, uBurst, uTreble, uIntensity, uBright, uPixelRatio, uWaveR, uWaveAmp;
 varying vec3 vColor;
 varying float vAlpha;
 varying float vHot;
-varying vec2 vClass; // x: gas, y: spark
+varying vec3 vClass; // x: gas, y: spark, z: hero spark
 
 void main() {
+  float kind = aArm.w;
+  float haze = step(0.5, kind) * (1.0 - step(1.5, kind));
+  float knot = step(1.5, kind) * (1.0 - step(2.5, kind));
+  float hero = step(2.5, kind);
   float gas = 1.0 - step(GAS_END, aSeed.w);
   float spark = step(SPARK_START, aSeed.w);
   float dust = 1.0 - gas - spark;
@@ -177,8 +327,8 @@ void main() {
   float e = histFreq(aSeed.x, rn * 14.0 + rA * 4.0);
   e = clamp(e * (0.65 + 0.5 * uIntensity), 0.0, 1.2);
 
-  // bass breathing of the whole shell, beat burst, and a shockwave sweeping outward after each beat
-  float breathe = 1.0 + uBass * 0.22 * (1.0 - 0.4 * rn);
+  // slow bass breathing of the whole shell (uBass is already attack/release smoothed on the CPU), beat burst, and a shockwave sweeping outward after each beat
+  float breathe = 1.0 + uBass * 0.10 * (0.4 + 0.6 * rn);
   float dW = (r0 * breathe - uWaveR) / 1.6;
   float wave = uWaveAmp * exp(-dW * dW);
   float rr = r0 * breathe + uBurst * (0.15 + 0.45 * rB) + wave * 1.1;
@@ -210,47 +360,60 @@ void main() {
   float front = -p.z / max(length(p), 0.001); // 1 straight ahead (-Z)
   float fw = 0.5 + 0.5 * smoothstep(-0.7, 0.9, front);
 
-  // colour: gas takes saturated palette hues by radius, dust the same hue but brighter with its band, sparks are near white
+  // colour: the gradient is spread by radius (near = low end, far = top end; violet / pink / gold in neon-sunset) and
+  // sprites are NOT normalised to full brightness: the dark low stops stay dark, so brightness follows the gradient (0.45..1)
   float hueMix = 0.95 * rn + 0.4 * (aArm.y - 0.5) + 0.4 * (n - 0.5);
-  float gc = clamp(0.5 + 1.5 * (hueMix - 0.48) + 0.14 * e + 0.1 * wave, 0.0, 1.0);
+  float gc = clamp(0.25 + 0.7 * hueMix + 0.08 * e + 0.08 * wave, 0.0, 1.0);
   vec3 gcol = texture2D(uGradient, vec2(gc, 0.5)).rgb;
-  vColor = gcol / max(max(gcol.r, max(gcol.g, gcol.b)), 0.25);
+  vColor = gcol * mix(0.45, 1.0, gc) / max(max(gcol.r, max(gcol.g, gcol.b)), 0.55);
 
   // treble sparkle
   float flick = pow(max(0.0, sin(uTime * (7.0 + 13.0 * rA) + ph * 9.0)), 8.0);
   float sp = flick * (0.15 + 1.5 * uTreble * uIntensity);
 
-  // sizes: gas 0.25-0.9 m (sprite = diameter), dust 0.03-0.08 m, sparks 0.02-0.045 m (small ones get a 3x glow sprite)
+  // sizes (sprite = diameter): gas 0.25-0.9 m, floor haze 0.5-1.2 m, dust 0.03-0.08 m, sparks 0.02-0.045 m (small ones get a 3x glow sprite),
+  // hero sparks 0.06-0.1 m
   float sz = gas * (0.25 + 0.65 * aSeed.z) + dust * (0.03 + 0.05 * aSeed.z) + spark * (0.02 + 0.025 * aSeed.z);
-  sz *= gas * (0.85 + 0.3 * fw + 0.25 * uBass) + dust * (0.75 + 0.7 * e) + spark * (1.0 + 1.2 * sp);
+  sz = mix(sz, 0.5 + 0.7 * aSeed.z, haze);
+  sz = mix(sz, 0.06 + 0.04 * aSeed.z, hero);
+  sz *= gas * (0.85 + 0.3 * fw + 0.25 * uBass) + dust * (0.75 + 0.7 * e) + spark * (1.0 + (1.2 - 0.7 * hero) * sp);
   sz *= 1.0 + 0.4 * uBurst * (1.0 - gas) + 0.5 * wave;
+  sz *= 1.0 + 0.25 * min(uBass, 1.0) * knot;                // the hero knot swells with the bass
 
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
   float dist = length(mv.xyz);
   float raw = sz * mix(3.0, 1.0, gas) * uPixelRatio * 300.0 / max(-mv.z, 0.1);
-  gl_PointSize = clamp(raw, 1.0, 56.0);
+  // large soft gas sprites are the fill-rate risk on Quest 2: never rasterise more than 40 px
+  gl_PointSize = clamp(raw, 1.0, mix(SPRITE_MAX_PX, GAS_MAX_PX, gas));
   gl_Position = projectionMatrix * mv;
 
-  // gas also fades out toward the floor so the cloud does not end in a hard edge
-  float near = smoothstep(1.0, 3.0, dist) * mix(1.0, smoothstep(3.0, 6.5, dist) * smoothstep(0.3, 1.6, p.y + EYE), gas);
+  // gas also fades out toward the floor so the cloud does not end in a hard edge (the haze lives there, so it only fades with distance)
+  float gasFade = mix(smoothstep(3.0, 6.5, dist) * smoothstep(0.3, 1.6, p.y + EYE), smoothstep(3.0, 6.0, dist), haze);
+  gasFade *= 1.0 - 0.6 * smoothstep(GAS_MAX_PX, 2.5 * GAS_MAX_PX, raw); // sprites that would exceed the cap fade instead of turning into dots
+  float near = smoothstep(1.0, 3.0, dist) * mix(1.0, gasFade, gas);
   float aGas = (0.03 + 0.05 * rB) * (0.5 + 1.0 * e) * clump * GAS_GAIN;
+  float aHaze = 0.02 * (0.7 + 0.6 * e) * (0.6 + 0.8 * clump);
   float aDust = (0.25 + 0.4 * rB) * (0.35 + 0.9 * e) * clump * DUST_GAIN;
   float aSpark = 0.15 + 0.9 * sp;
-  float alpha = (gas * aGas + dust * aDust + spark * aSpark) * fw + wave * (0.12 * gas + 0.9 * (1.0 - gas)) + 0.1 * uBurst * e;
+  float aHero = 0.35 + 0.5 * (0.5 + 0.5 * sin(uTime * (0.7 + 1.1 * rA) + ph)) + 1.2 * sp;
+  float alpha = (gas * mix(aGas, aHaze, haze) + dust * aDust + spark * mix(aSpark, aHero, hero)) * fw
+              + wave * (0.12 * gas * (1.0 - 0.75 * haze) + 0.9 * (1.0 - gas)) + 0.1 * uBurst * e;
+  alpha *= 1.0 + 0.5 * knot;                                 // hero knot: x1.5 brightness
   // sub-pixel sprites keep their energy but lose coverage (no shimmer); big sprites spread theirs over more pixels
   float cover = min(1.0, raw * raw) * min(1.0, 48.0 / raw);
   vAlpha = alpha * uBright * near * cover;
   vHot = clamp(wave * 0.7 + uBurst * 0.2 * e, 0.0, 1.0);
-  vClass = vec2(gas, spark);
+  vClass = vec3(gas, spark, hero);
 }
 `;
 
 const NEBULA_FRAG = /* glsl */ `
+uniform vec3 uAccent;
 uniform float uOpacity;
 varying vec3 vColor;
 varying float vAlpha;
 varying float vHot;
-varying vec2 vClass;
+varying vec3 vClass;
 
 void main() {
   vec2 c = gl_PointCoord * 2.0 - 1.0;
@@ -259,9 +422,15 @@ void main() {
   float gasShape = exp(-d2 * 3.2) * edge;                           // soft, no core
   float dustShape = exp(-d2 * 16.0) + 0.45 * exp(-d2 * 5.0) * edge;  // coloured core + halo
   float sparkShape = exp(-d2 * 34.0) + 0.3 * exp(-d2 * 7.0) * edge;  // tight bright point
-  float a = mix(mix(dustShape, sparkShape, vClass.y), gasShape, vClass.x);
-  // white only on sparks; beats just push the palette colour brighter
-  vec3 col = mix(vColor * (1.0 + 0.6 * vHot), vec3(1.0), vClass.y * 0.85);
+  // hero spark: bright core plus a 4-point flare (thin horizontal / vertical rays) that reads as a bloom cue
+  vec2 ac = abs(c);
+  float rays = exp(-ac.y * 26.0) * exp(-ac.x * 3.2) * (1.0 - smoothstep(0.55, 1.0, ac.x))
+             + exp(-ac.x * 26.0) * exp(-ac.y * 3.2) * (1.0 - smoothstep(0.55, 1.0, ac.y));
+  float heroShape = exp(-d2 * 60.0) + 0.25 * exp(-d2 * 9.0) * edge + 0.9 * rays;
+  float a = mix(mix(dustShape, mix(sparkShape, heroShape, vClass.z), vClass.y), gasShape, vClass.x);
+  // small sparks are near white, hero sparks lean on the palette accent; beats push the palette colour brighter
+  vec3 sparkCol = mix(uAccent, vec3(1.0), 0.35 + 0.5 * (1.0 - vClass.z));
+  vec3 col = mix(vColor * (1.0 + 0.6 * vHot), sparkCol, vClass.y * 0.85);
   gl_FragColor = vec4(col * (a * vAlpha * uOpacity), 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
@@ -270,7 +439,7 @@ void main() {
 
 const DUST_VERT = /* glsl */ `
 ${HISTORY_GLSL}
-// position = offset from the head (0.55..2.2 m), aSeed = (band, phase, size, twinkle)
+// position = offset from the head (1.0..2.6 m), aSeed = (band, phase, size, twinkle)
 attribute vec4 aSeed;
 uniform float uTime, uBeat, uBright, uPixelRatio, uIntensity;
 varying float vAlpha;
@@ -287,12 +456,15 @@ void main() {
 
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
   float dist = length(mv.xyz);
-  float sz = 0.012 + 0.03 * aSeed.z * aSeed.z;
+  // power-law sizes 0.008..0.05 m: u^8 keeps 80 % of the motes below 0.015 m
+  float u2 = aSeed.z * aSeed.z, u4 = u2 * u2;
+  float sz = 0.008 + 0.042 * u4 * u4;
   float raw = sz * 2.6 * uPixelRatio * 300.0 / max(-mv.z, 0.1);
   gl_PointSize = clamp(raw, 1.0, 48.0);
   gl_Position = projectionMatrix * mv;
-  float near = smoothstep(0.45, 1.1, dist);
-  vAlpha = (0.08 + 0.25 * e * uIntensity + 0.08 * uBeat) * tw * near * uBright * min(1.0, raw * raw);
+  float near = smoothstep(0.9, 1.6, dist);                   // nothing closer than ~1 m
+  float alpha = (0.08 + 0.25 * e * uIntensity + 0.08 * uBeat) * tw * near * uBright * min(1.0, raw * raw);
+  vAlpha = min(alpha, 0.25);
 }
 `;
 
@@ -331,76 +503,26 @@ export class NebulaParticles implements Preset {
   private swirl = 0;
   private drift = 0;
   private beatAge = 99;
+  /** bass with a 90 ms attack / 350 ms release, so the shell breathes instead of pumping */
+  private bassFollow = 0;
 
   init(ctx: PresetContext): void {
     this.ctx = ctx;
     const count = COUNTS[ctx.quality];
     const pr = ctx.renderer.getPixelRatio();
+    const rng = makeRng(layoutSeed());
 
     // --- nebula ---------------------------------------------------------------------------
-    const arms = makeArms();
-    const home = new Float32Array(count * 3);
-    const seed = new Float32Array(count * 4);
-    const armData = new Float32Array(count * 3);
-    const pt = new THREE.Vector3();
-    for (let i = 0; i < count; ) {
-      const cls = Math.random();
-      const gas = cls < GAS_END;
-      const spark = cls >= SPARK_START;
-      let band: number;
-      let omega: number;
-      let hue: number;
-      if (Math.random() < HALO_FRACTION) {
-        // sparse halo: bell-shaped elevation, denser in front
-        let phi = Math.random() * TAU;
-        phi -= 0.4 * Math.sin(phi);
-        const el = ((Math.random() + Math.random() + Math.random()) / 3 * 2 - 1) * 1.1;
-        const r = R_MIN + 1 + (R_MAX + 2 - R_MIN - 1) * Math.pow(Math.random(), 0.8);
-        const ce = Math.cos(el);
-        pt.set(r * ce * Math.sin(phi), r * Math.sin(el), -r * ce * Math.cos(phi));
-        band = Math.random();
-        omega = (Math.random() < 0.5 ? -1 : 1) * rand(0.01, 0.04);
-        hue = 0.5;
-      } else {
-        const ai = Math.floor(Math.random() * ARM_COUNT);
-        const arm = arms[ai];
-        const u = Math.random();
-        if (Math.random() > Math.pow(Math.sin(Math.PI * u), 0.6)) continue; // taper toward both ends
-        armPoint(arm, u, pt);
-        // cross-section: wide for gas, tight for the dust that traces the filament, pinching and swelling along the arm
-        const pinch = 0.6 + 0.8 * valueNoise(u * 5 + ai * 7.3, ai * 3.1, 1.7);
-        const sigma = (gas ? rand(0.8, 1.3) : spark ? 0.7 : rand(0.25, 0.5)) * pinch;
-        pt.x += gauss() * sigma;
-        pt.y += gauss() * sigma * 0.8;
-        pt.z += gauss() * sigma;
-        band = (ai + u) / ARM_COUNT;
-        omega = arm.omega;
-        hue = ai / (ARM_COUNT - 1);
-      }
-      // nothing below the floor or on top of the head; thin out smoothly toward the floor
-      if (EYE + pt.y < 0.3 || pt.length() < 2 || Math.random() > smooth(0.3, 1.8, EYE + pt.y)) continue;
-      const n = 0.65 * valueNoise(pt.x * 0.2, pt.y * 0.2, pt.z * 0.2) + 0.35 * valueNoise(pt.x * 0.47 + 7.1, pt.y * 0.47, pt.z * 0.47 + 3.7);
-      if (Math.random() > 0.35 + 0.65 * smooth(0.3, 0.7, n)) continue; // extra clumping: voids inside the arms
-      home[i * 3] = pt.x;
-      home[i * 3 + 1] = pt.y;
-      home[i * 3 + 2] = pt.z;
-      seed[i * 4] = Math.min(0.98, Math.max(0.02, band + rand(-0.04, 0.04)));
-      seed[i * 4 + 1] = Math.random();
-      seed[i * 4 + 2] = Math.random();
-      seed[i * 4 + 3] = cls;
-      armData[i * 3] = omega;
-      armData[i * 3 + 1] = hue;
-      armData[i * 3 + 2] = Math.random();
-      i++;
-    }
+    const layout = buildLayout(count, rng);
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(home, 3));
-    geo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 4));
-    geo.setAttribute('aArm', new THREE.BufferAttribute(armData, 3));
+    geo.setAttribute('position', new THREE.BufferAttribute(layout.home, 3));
+    geo.setAttribute('aSeed', new THREE.BufferAttribute(layout.seed, 4));
+    geo.setAttribute('aArm', new THREE.BufferAttribute(layout.arm, 4));
 
     this.nu = {
       ...ctx.textures.uniforms,
       uGradient: { value: ctx.palette.gradient },
+      uAccent: { value: ctx.palette.accent },
       uTime: { value: 0 },
       uSwirl: { value: 0 },
       uDrift: { value: 0 },
@@ -429,29 +551,29 @@ export class NebulaParticles implements Preset {
     this.nebula.frustumCulled = false;
     this.group.add(this.nebula);
 
-    // --- dust motes (sparse, soft, for parallax) -------------------------------------------
+    // --- dust motes (sparse, soft, for parallax; never closer than 1 m) ---------------------
     const dPos = new Float32Array(DUST_COUNT * 3);
     const dSeed = new Float32Array(DUST_COUNT * 4);
-    const lo = 0.55 ** 3;
-    const hi = 2.2 ** 3;
+    const lo = 1.0 ** 3;
+    const hi = 2.6 ** 3;
     for (let i = 0; i < DUST_COUNT; i++) {
-      const u = Math.random() * 2 - 1;
-      const phi = Math.random() * TAU;
+      const u = rng.next() * 2 - 1;
+      const phi = rng.next() * TAU;
       const s = Math.sqrt(1 - u * u);
-      const d = Math.cbrt(lo + (hi - lo) * Math.random());
+      const d = Math.cbrt(lo + (hi - lo) * rng.next());
       let y = u * d;
       if (y < -1.3) y = -1.3 + (-1.3 - y) * 0.5; // keep the motes above the floor
       dPos[i * 3] = d * s * Math.cos(phi);
       dPos[i * 3 + 1] = y;
       dPos[i * 3 + 2] = d * s * Math.sin(phi);
-      for (let k = 0; k < 4; k++) dSeed[i * 4 + k] = Math.random();
+      for (let k = 0; k < 4; k++) dSeed[i * 4 + k] = rng.next();
     }
     const dGeo = new THREE.BufferGeometry();
     dGeo.setAttribute('position', new THREE.BufferAttribute(dPos, 3));
     dGeo.setAttribute('aSeed', new THREE.BufferAttribute(dSeed, 4));
     this.du = {
       ...ctx.textures.uniforms,
-      uColor: { value: ctx.palette.accent },
+      uColor: { value: ctx.palette.secondary },
       uTime: { value: 0 },
       uBeat: { value: 0 },
       uBright: { value: 0.92 },
@@ -483,6 +605,8 @@ export class NebulaParticles implements Preset {
     this.swirl += d * p.speed * (0.35 + 1.4 * f.mid);
     if (f.beat) this.beatAge = 0;
     else this.beatAge += d;
+    const bassTarget = Math.min(1.3, f.bass * p.intensity);
+    this.bassFollow += (bassTarget - this.bassFollow) * (1 - Math.exp(-d / (bassTarget > this.bassFollow ? 0.09 : 0.35)));
 
     const pr = this.ctx.renderer.getPixelRatio();
     const bright = 0.6 + 0.4 * p.glow;
@@ -490,7 +614,7 @@ export class NebulaParticles implements Preset {
     nu.uTime.value = this.clock;
     nu.uSwirl.value = this.swirl;
     nu.uDrift.value = this.drift;
-    nu.uBass.value = Math.min(1.3, f.bass * p.intensity);
+    nu.uBass.value = this.bassFollow;
     nu.uBurst.value = f.beatEnv * p.intensity;
     nu.uTreble.value = Math.min(1.2, f.treble);
     nu.uIntensity.value = p.intensity;

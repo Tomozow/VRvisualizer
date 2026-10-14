@@ -2,19 +2,23 @@ import * as THREE from 'three';
 import type { AudioFeatures } from '@/audio/types';
 import type { Preset, PresetContext, VizParams } from '@/viz/types';
 
-const CORE_POS = new THREE.Vector3(0, 1.6, -3); // 3 m ahead at eye height
-const CORE_RADIUS = 1.2;
+const CORE_POS = new THREE.Vector3(0, 1.6, -6); // 6 m ahead at eye height: the nearest surface is > 3.4 m from the head
+const CORE_RADIUS = 2.0;
 const SHOCK_SLOTS = 6;
 const SHOCK_LIFE = 1.2; // seconds
-const SHOCK_R0 = 1.3;
-const SHOCK_R_WALL = 10; // upright ring facing the user
+const SHOCK_R0 = 2.2;
+const SHOCK_R_WALL = 16; // upright ring facing the user
 const SHOCK_R_FLOOR = 24; // ring on the floor, so the room behind you pulses too
-const RING_RADII = [1.95, 2.3, 2.65];
+const RING_RADII = [3.3, 3.9, 4.5];
+const BACK_CORONA_POS = new THREE.Vector3(0, 1.6, 8); // dim glow behind the listener so the back is never empty
+const BURST_LIFE = 0.6; // seconds a beat burst of sparks lives
+const CLEAR_NEAR = 1.2; // metres: nothing is drawn closer to the head than this
+const CLEAR_FAR = 2.4; // ... and everything is fully visible beyond this
 
 const QUALITY = {
-  low: { freq: 24, swarm: 1000 },
-  medium: { freq: 48, swarm: 2000 },
-  high: { freq: 64, swarm: 3500 },
+  low: { freq: 24, swarm: 1500, sparks: 100 },
+  medium: { freq: 48, swarm: 3000, sparks: 150 },
+  high: { freq: 64, swarm: 4500, sparks: 220 },
 } as const;
 
 /** Compact 3D simplex noise (Ashima / Ian McEwan, MIT). Returns roughly -1..1. */
@@ -84,12 +88,13 @@ varying vec3 vDir;
 varying vec3 vBase;
 varying float vDisp;
 
+// radial displacement relative to the core radius
 float displace(vec3 n) {
   float t = uTime;
   float lobes = snoise(n * 1.1 + vec3(0.0, t * 0.16, t * 0.10));
   float ripple = snoise(n * 9.0 + vec3(0.0, t * 1.5, t * 1.1));
-  float d = lobes * (0.04 + 0.15 * uBass + 0.05 * uBeat) + ripple * (0.002 + 0.02 * min(uTreble, 1.0));
-  return clamp(d, -0.2, 0.2); // <= 0.18 x radius of lobes; keeps the surface > 1 m from the listener
+  float d = lobes * (0.035 + 0.125 * uBass + 0.04 * uBeat) + ripple * (0.002 + 0.017 * min(uTreble, 1.0));
+  return clamp(d, -0.17, 0.17); // keeps the surface > 3 m from the listener
 }
 
 void main() {
@@ -102,9 +107,9 @@ void main() {
   vec3 n1 = normalize(n + t1 * E);
   vec3 n2 = normalize(n + t2 * E);
   float d0 = displace(n);
-  vec3 p0 = n * (R + d0);
-  vec3 p1 = n1 * (R + displace(n1));
-  vec3 p2 = n2 * (R + displace(n2));
+  vec3 p0 = n * R * (1.0 + d0);
+  vec3 p1 = n1 * R * (1.0 + displace(n1));
+  vec3 p2 = n2 * R * (1.0 + displace(n2));
   vec3 nrm = normalize(cross(p1 - p0, p2 - p0));
 
   vec4 wp = modelMatrix * vec4(p0, 1.0);
@@ -121,7 +126,7 @@ ${SIMPLEX_GLSL}
 uniform sampler2D uGradient;
 uniform vec3 uAccent;
 uniform vec3 uPrimary;
-uniform vec3 uBackground;
+uniform vec3 uSecondary;
 uniform float uTime;
 uniform float uOpacity;
 uniform float uBrightness;
@@ -141,24 +146,25 @@ void main() {
   float ndv = clamp(dot(normalize(mix(Nb, N, 0.75)), V), 0.0, 1.0);
   vec3 L = normalize(vec3(0.4, 0.7, 0.6));
 
-  // Dark glass sphere of energy: the body uses only the dark half of the gradient (0.05..0.5) with its
-  // luminance capped at 0.16; only a few thin veins, the inner glow and the rim are bright.
-  float dn = clamp(vDisp * 2.2 + 0.5, 0.0, 1.0);
-  vec3 grad = texture2D(uGradient, vec2(0.05 + 0.45 * dn, 0.5)).rgb;
-  vec3 body = uBackground * 1.6 * (0.5 + 0.5 * max(dot(N, L), 0.0));
-  body += grad * (0.25 + 0.4 * uBass) * (0.15 + 0.85 * dn);
+  // Dark glass sphere of energy: the body is the violet-to-pink part of the gradient (0.15..0.55) with its
+  // luminance capped at 0.10 and no neutral tint; the veins, the inner light and the rim carry all the brightness.
+  float dn = clamp(vDisp * 2.6 + 0.5, 0.0, 1.0);
+  vec3 grad = texture2D(uGradient, vec2(0.15 + 0.40 * dn, 0.5)).rgb;
+  vec3 body = grad * (0.35 + 0.65 * max(dot(N, L), 0.0)) * (0.3 + 0.7 * dn) * (0.8 + 0.8 * uBass);
   float lum = dot(body, vec3(0.2126, 0.7152, 0.0722));
-  vec3 col = body * min(1.0, 0.16 / max(lum, 1e-4));
+  vec3 col = body * min(1.0, 0.10 / max(lum, 1e-4));
 
-  // veins: zero set of a low-frequency noise -> a few thin arcs (~10 % of the surface) with a soft glow falloff (<= 1.3)
+  // veins: zero set of a low-frequency noise -> a few thin arcs (~10 % of the surface) with a soft glow falloff
   float vn = abs(snoise(vDir * 2.0 + vec3(0.0, uTime * 0.12, uTime * 0.07)));
   float vein = min((1.0 - smoothstep(0.0, 0.045, vn)) + exp(-vn * 14.0) * 0.3, 1.0);
   vec3 veinCol = texture2D(uGradient, vec2(0.45 + 0.3 * dn, 0.5)).rgb;
-  col += veinCol * vein * min(0.6 + 0.9 * uBass + 0.6 * uBeat, 1.3);
+  col += veinCol * vein * (1.2 + 0.6 * min(uBass + 0.5 * uBeat, 1.0)); // up to 1.8
 
-  // soft core light (inverse Fresnel), thin bright Fresnel rim (<= 1.6), small specular
-  col += uPrimary * pow(ndv, 4.0) * 0.18;
-  col += mix(uAccent, uPrimary, 0.45) * pow(1.0 - ndv, 4.5) * 1.6;
+  // inner emissive light shining through the glass, strongest face-on, breathing with the bass
+  col += texture2D(uGradient, vec2(0.6 + 0.3 * dn, 0.5)).rgb * (0.25 + 0.8 * uBass) * pow(ndv, 4.0) * 0.16;
+
+  // Fresnel rim tinted with the palette's secondary colour, small specular
+  col += uSecondary * pow(1.0 - ndv, 3.0) * 1.2;
   vec3 H = normalize(L + V);
   col += mix(uAccent, uPrimary, 0.3) * pow(max(dot(N, H), 0.0), 32.0) * 0.3;
 
@@ -168,19 +174,23 @@ void main() {
 }`;
 
 // ---------------------------------------------------------------------------------------------
-// Corona: a camera-facing quad behind the core. (A single huge gl_PointSize would be clamped by many GPUs.)
+// Corona: camera-facing quads, two instances (behind the core, and a dim one behind the listener).
+// (A single huge gl_PointSize would be clamped by many GPUs.) aCor = (width in m, gain, bass pulse amount).
 // ---------------------------------------------------------------------------------------------
 const CORONA_VERTEX = /* glsl */ `
-uniform float uSize;
+attribute vec3 aCor;
+uniform float uSizeBoost;
 varying vec2 vUv;
+varying vec3 vCor;
 void main() {
   vUv = position.xy * 2.0;
-  vec4 mv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
-  // push the quad 1.4 m further away along the view ray: behind the whole displaced core, so depth testing
+  vCor = aCor;
+  vec4 mv = modelViewMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+  // push the quad 2.6 m further away along the view ray: behind the whole displaced core, so depth testing
   // keeps it off the core's surface while its projected centre and angular size stay unchanged
-  float k = (length(mv.xyz) + 1.4) / length(mv.xyz);
+  float k = (length(mv.xyz) + 2.6) / length(mv.xyz);
   mv.xyz *= k;
-  mv.xy += position.xy * uSize * k;
+  mv.xy += position.xy * (aCor.x + uSizeBoost) * k;
   gl_Position = projectionMatrix * mv;
 }`;
 
@@ -191,13 +201,16 @@ uniform float uOpacity;
 uniform float uBrightness;
 uniform float uLevel;
 uniform float uBeat;
+uniform float uBass;
 varying vec2 vUv;
+varying vec3 vCor;
 void main() {
   float d = length(vUv);
   float fall = 1.0 - smoothstep(0.0, 1.0, d);
   float glow = pow(fall, 2.4);
-  vec3 col = uPrimary * glow * (0.3 + 0.4 * uLevel);
-  col += mix(uAccent, uPrimary, 0.3) * pow(fall, 4.0) * uBeat * 0.35; // inner flash on the beat
+  float pulse = mix(1.0, 0.45 + 1.1 * uBass, vCor.z); // the back corona swells with the bass
+  vec3 col = uPrimary * glow * (0.3 + 0.4 * uLevel) * vCor.y * pulse;
+  col += mix(uAccent, uPrimary, 0.3) * pow(fall, 4.0) * uBeat * 0.35 * vCor.y; // inner flash on the beat
   gl_FragColor = vec4(col * uBrightness * uOpacity, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
@@ -238,7 +251,7 @@ void main() {
   vec3 col = texture2D(uGradient, vec2(0.4 + 0.15 * k + 0.35 * comet, 0.5)).rgb;
   col *= (0.08 + comet) * (0.5 + 1.8 * uMid + 0.8 * uBeat);
   // never draw close to the listener's head
-  col *= smoothstep(0.8, 1.9, distance(vWorld, cameraPosition));
+  col *= smoothstep(${CLEAR_NEAR.toFixed(1)}, ${CLEAR_FAR.toFixed(1)}, distance(vWorld, cameraPosition));
   gl_FragColor = vec4(col * uBrightness * uOpacity, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
@@ -276,21 +289,24 @@ varying float vPower;
 varying vec3 vWorld;
 void main() {
   float d = (1.0 - vRho) * vScale;   // metres behind the leading edge
-  // thin (~8 cm) bright ring at the leading edge + a faint wake
-  float ed = (d - 0.05) / 0.035;
+  // thin (~12 cm) bright ring at the leading edge + a faint wake
+  float ed = (d - 0.08) / 0.055;
   float ring = exp(-ed * ed);
   float wake = smoothstep(0.0, 0.06, d) * exp(-d * 4.0) * 0.06;
   float life = pow(clamp(1.0 - vAge, 0.0, 1.0), 1.3);
-  vec3 col = uAccent * (ring * 2.6 + wake);
-  col *= life * vPower * uBrightness * uOpacity * smoothstep(0.8, 2.0, distance(vWorld, cameraPosition));
+  vec3 col = uAccent * (ring * 1.9 + wake);
+  col *= min(1.0, 1.1 / max(max(col.r, max(col.g, col.b)), 1e-4)); // stay saturated instead of washing out to white
+  col *= life * vPower * uBrightness * uOpacity * smoothstep(${CLEAR_NEAR.toFixed(1)}, ${CLEAR_FAR.toFixed(1)}, distance(vWorld, cameraPosition));
   gl_FragColor = vec4(col, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }`;
 
 // ---------------------------------------------------------------------------------------------
-// Swarm: 78 % of the points orbit the core on noise-perturbed, tilted orbits; the rest is dust that
-// fills the whole room (including behind the listener). Positions are computed entirely on the GPU.
+// Swarm: 55 % of the points orbit the core on noise-perturbed, tilted orbits; 45 % is dust that fills the whole
+// room (including behind the listener). A few points of each are larger "hero" sprites. The first `sparks`
+// points (position.x < 0) are the beat burst: they live ~0.6 s after every beat, computed statelessly from
+// uBurstTime and a per-beat seed, so the burst costs no extra draw call. Everything is computed on the GPU.
 // ---------------------------------------------------------------------------------------------
 const SWARM_VERTEX = /* glsl */ `
 ${SIMPLEX_GLSL}
@@ -302,19 +318,43 @@ uniform float uBass;
 uniform float uTreble;
 uniform float uBeat;
 uniform float uViewportH;
+uniform float uBurstTime;  // seconds since the last beat
+uniform float uBurstSeed;  // 0..1, changes with every beat so successive bursts differ
+uniform float uBurstPower; // 0.55..1 from the beat strength
 varying vec3 vColor;
 const float TAU = 6.28318530718;
+const vec3 CORE = vec3(${CORE_POS.x.toFixed(1)}, ${CORE_POS.y.toFixed(1)}, ${CORE_POS.z.toFixed(1)});
 
 void main() {
-  vec3 r = position; // per-point random numbers
+  vec3 r = position; // per-point random numbers (x < 0 marks a spark)
   vec4 s = aSeed;
   vec3 p;
   float size;
   float tint;
   float gain;
-  if (r.x < 0.78) {
-    // orbiting swarm
-    float R = 1.9 + 3.3 * pow(r.y, 1.4);
+  if (r.x < 0.0) {
+    // beat spark: radial burst with a fast start and slow finish, a little sag, shrinking and fading out
+    float life = uBurstTime / ${BURST_LIFE.toFixed(2)};
+    if (life >= 1.0) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // outside the clip volume
+      gl_PointSize = 0.0;
+      vColor = vec3(0.0);
+      return;
+    }
+    vec3 q = fract(s.xyz + uBurstSeed * vec3(1.0, 1.7, 2.3));
+    float cu = q.x * 2.0 - 1.0;
+    float ph = q.y * TAU;
+    float sr = sqrt(1.0 - cu * cu);
+    vec3 dir = vec3(sr * cos(ph), cu, sr * sin(ph));
+    float travel = (3.0 + 6.0 * q.z) * (1.0 - 0.7 * smoothstep(0.0, 0.9, dir.z)); // the burst never rushes the listener
+    float ease = 1.0 - pow(1.0 - life, 2.2);
+    p = CORE + dir * (${CORE_RADIUS.toFixed(2)} * 1.02 + travel * ease) - vec3(0.0, 0.8 * life * life, 0.0);
+    size = (0.08 + 0.09 * s.w) * (1.0 - 0.5 * life);
+    tint = 0.82 + 0.16 * s.w;
+    gain = 3.0 * uBurstPower * pow(1.0 - life, 1.2);
+  } else if (r.x < 0.55) {
+    // orbiting swarm, radius 3.2 .. 8.9 m around the core
+    float R = 3.2 + 5.7 * pow(r.y, 1.4);
     float ang = s.x * TAU + uOrbit * (0.45 + 0.9 * s.y) / pow(R, 0.7);
     vec3 q = vec3(cos(ang), (s.z - 0.5) * 0.35, sin(ang)) * R;
     float incl = (r.z - 0.5) * 2.2;
@@ -323,41 +363,45 @@ void main() {
     float node = s.w * TAU;
     float cn = cos(node), sn = sin(node);
     q = vec3(q.x * cn + q.z * sn, q.y, -q.x * sn + q.z * cn);
-    vec3 nq = q * 0.55;
-    q += 0.32 * vec3(snoise(nq + vec3(0.0, uTime * 0.17, 0.0)),
-                     snoise(nq + vec3(11.0, uTime * 0.13, 3.0)),
-                     snoise(nq + vec3(5.0, uTime * 0.11, -7.0)));
+    vec3 nq = q * 0.3;
+    q += 0.5 * vec3(snoise(nq + vec3(0.0, uTime * 0.17, 0.0)),
+                    snoise(nq + vec3(11.0, uTime * 0.13, 3.0)),
+                    snoise(nq + vec3(5.0, uTime * 0.11, -7.0)));
     q *= 1.0 + 0.16 * uBeat + 0.05 * uBass;
-    p = vec3(${CORE_POS.x.toFixed(1)}, ${CORE_POS.y.toFixed(1)}, ${CORE_POS.z.toFixed(1)}) + q;
-    size = 0.03 + 0.05 * s.y;
+    p = CORE + q;
+    float hero = step(0.985, fract(sin(dot(s.xy, vec2(12.9898, 78.233))) * 43758.5453));
+    size = mix(0.02 + 0.10 * s.y * s.y * s.y, 0.18, hero);
     tint = 0.3 + 0.55 * s.y + 0.12 * uTreble;
-    gain = 1.0;
+    gain = 1.0 + 0.4 * hero;
   } else {
     // ambient dust on a shell around the listener
     float cu = r.y * 2.0 - 1.0;
     float ph = r.z * TAU + uTime * 0.02;
     float sr = sqrt(1.0 - cu * cu);
     vec3 dir = vec3(sr * cos(ph), cu, sr * sin(ph));
-    float rad = (7.0 + 17.0 * s.x) * (1.0 + 0.03 * uBass + 0.04 * uBeat);
+    if (s.w < 0.35) dir.z = abs(dir.z); // a third of the dust is folded behind the listener: ~2/3 of it fills the back
+    float rad = (5.0 + 17.0 * s.x) * (1.0 + 0.03 * uBass + 0.04 * uBeat);
     p = vec3(0.0, 1.6, 0.0) + dir * rad;
     p.y = abs(p.y - 0.3) + 0.3; // stay above the floor
     vec3 np = p * 0.12;
     p += 1.1 * vec3(snoise(np + vec3(0.0, uTime * 0.05, 0.0)),
                     snoise(np + vec3(9.0, uTime * 0.04, 2.0)),
                     snoise(np + vec3(4.0, uTime * 0.045, -5.0)));
-    size = 0.05 + 0.09 * s.y;
+    float hero = step(0.985, fract(sin(dot(s.xy, vec2(39.346, 11.135))) * 43758.5453));
+    size = mix(0.04 + 0.10 * s.y * s.y, 0.18, hero);
     tint = 0.2 + 0.4 * s.y + 0.1 * uTreble;
-    gain = 0.45;
+    gain = 1.05 + 0.3 * hero;
   }
 
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
   float dist = max(-mv.z, 0.1);
   float px = size * (1.0 + 0.6 * uTreble) * 0.5 * uViewportH * projectionMatrix[1][1] / dist;
   gl_PointSize = clamp(px, 1.5, 26.0);
-  // fade out anything that would pass close to the listener's eyes
-  float near = smoothstep(0.7, 1.8, length(mv.xyz));
-  float twinkle = 0.65 + 0.35 * sin(uTime * (1.0 + 2.0 * s.z) + s.w * 40.0);
-  vColor = texture2D(uGradient, vec2(clamp(tint, 0.0, 1.0), 0.5)).rgb * gain * near * twinkle;
+  // fade out anything that would pass close to the listener's eyes: nothing is drawn within 1.2 m
+  float near = smoothstep(${CLEAR_NEAR.toFixed(1)}, ${CLEAR_FAR.toFixed(1)}, length(mv.xyz));
+  float twinkle = r.x < 0.0 ? 1.0 : 0.65 + 0.35 * sin(uTime * (1.0 + 2.0 * s.z) + s.w * 40.0);
+  float depthFade = r.x < 0.0 ? 1.0 : exp(-dist * 0.05); // distant points dim out
+  vColor = texture2D(uGradient, vec2(clamp(tint, 0.0, 1.0), 0.5)).rgb * gain * near * twinkle * depthFade;
   gl_Position = projectionMatrix * mv;
 }`;
 
@@ -427,10 +471,11 @@ function createIcoSphere(freq: number): THREE.BufferGeometry {
 }
 
 /**
- * A living core 3 m ahead of the listener, with a corona, three orbit rings, beat shockwaves
- * (upright rings + floor rings) and a 2000-point orbiting swarm / room dust.
- * Draw calls: core, corona, rings (instanced), shockwaves (instanced, 12 slots), swarm = 5.
- * Vertices (medium): core 23k indexed, everything else < 3k.
+ * A living core 6 m ahead of the listener, with a corona (plus a dim one behind the listener), three orbit rings,
+ * beat shockwaves (upright rings + floor rings) and a 3000-point orbiting swarm / room dust that also carries the
+ * 150 sparks of the beat burst.
+ * Draw calls: core, corona (instanced x2), rings (instanced), shockwaves (instanced, 12 slots), swarm + sparks = 5.
+ * Vertices (medium): core 23k indexed, swarm 3.15k points, everything else < 3k.
  */
 export class PulseCore implements Preset {
   readonly id = 'pulse';
@@ -457,6 +502,9 @@ export class PulseCore implements Preset {
   private readonly age = new Float32Array(SHOCK_SLOTS).fill(1);
   private readonly power = new Float32Array(SHOCK_SLOTS);
   private readonly tilt = new Float32Array(SHOCK_SLOTS * 2);
+  private burstTime = 99; // seconds since the last beat (>= BURST_LIFE: no sparks)
+  private burstSeed = 0;
+  private burstPower = 0.55;
   private readonly dummy = new THREE.Object3D();
   private readonly sizeTmp = new THREE.Vector2();
 
@@ -469,7 +517,7 @@ export class PulseCore implements Preset {
       uGradient: { value: palette.gradient },
       uAccent: { value: palette.accent },
       uPrimary: { value: palette.primary },
-      uBackground: { value: palette.background },
+      uSecondary: { value: palette.secondary },
       uTime: { value: 0 },
       uLevel: { value: 0 },
       uBeat: { value: 0 },
@@ -493,8 +541,10 @@ export class PulseCore implements Preset {
     this.core.renderOrder = 0;
 
     // --- corona ---
-    this.coronaU = { ...shared(), uSize: { value: 6 } };
+    this.coronaU = { ...shared(), uSizeBoost: { value: 0 }, uBass: { value: 0 } };
     const coronaGeo = new THREE.PlaneGeometry(1, 1);
+    // instance 0: behind the core (11 m wide); instance 1: dim and bass-pulsed behind the listener (9 m, 0.35x)
+    coronaGeo.setAttribute('aCor', new THREE.InstancedBufferAttribute(new Float32Array([11, 0.75, 0, 9, 0.35 * 0.75, 1]), 3));
     const coronaMat = new THREE.ShaderMaterial({
       uniforms: this.coronaU,
       vertexShader: CORONA_VERTEX,
@@ -503,8 +553,10 @@ export class PulseCore implements Preset {
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
-    const corona = new THREE.Mesh(coronaGeo, coronaMat);
-    corona.position.copy(CORE_POS);
+    const corona = new THREE.InstancedMesh(coronaGeo, coronaMat, 2);
+    corona.setMatrixAt(0, this.dummy.matrix.makeTranslation(CORE_POS.x, CORE_POS.y, CORE_POS.z));
+    corona.setMatrixAt(1, this.dummy.matrix.makeTranslation(BACK_CORONA_POS.x, BACK_CORONA_POS.y, BACK_CORONA_POS.z));
+    corona.instanceMatrix.needsUpdate = true;
     corona.frustumCulled = false;
     corona.renderOrder = 1;
 
@@ -547,12 +599,23 @@ export class PulseCore implements Preset {
     this.writeShockMatrices();
 
     // --- swarm ---
-    this.swarmU = { ...shared(), uOrbit: { value: 0 }, uBass: { value: 0 }, uTreble: { value: 0 }, uViewportH: { value: 1080 } };
+    this.swarmU = {
+      ...shared(),
+      uOrbit: { value: 0 },
+      uBass: { value: 0 },
+      uTreble: { value: 0 },
+      uViewportH: { value: 1080 },
+      uBurstTime: { value: this.burstTime },
+      uBurstSeed: { value: 0 },
+      uBurstPower: { value: this.burstPower },
+    };
     const swarmGeo = new THREE.BufferGeometry();
-    const rnd = new Float32Array(q.swarm * 3);
-    const seed = new Float32Array(q.swarm * 4);
+    const total = q.swarm + q.sparks;
+    const rnd = new Float32Array(total * 3);
+    const seed = new Float32Array(total * 4);
     for (let i = 0; i < rnd.length; i++) rnd[i] = Math.random();
     for (let i = 0; i < seed.length; i++) seed[i] = Math.random();
+    for (let i = 0; i < q.sparks; i++) rnd[i * 3] = -1; // the first points are the beat sparks
     swarmGeo.setAttribute('position', new THREE.BufferAttribute(rnd, 3)); // random numbers, not positions
     swarmGeo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 4));
     const swarmMat = new THREE.ShaderMaterial({
@@ -569,7 +632,7 @@ export class PulseCore implements Preset {
 
     this.group.add(this.core, corona, this.rings, this.shock, swarm);
     this.allUniforms = [this.coreU, this.coronaU, this.ringU, this.shockU, this.swarmU];
-    this.disposables.push(coreGeo, coreMat, coronaGeo, coronaMat, ringGeo, ringMat, shockGeo, shockMat, swarmGeo, swarmMat, this.rings, this.shock);
+    this.disposables.push(coreGeo, coreMat, coronaGeo, coronaMat, corona, ringGeo, ringMat, shockGeo, shockMat, swarmGeo, swarmMat, this.rings, this.shock);
     this.updateRings();
   }
 
@@ -592,7 +655,8 @@ export class PulseCore implements Preset {
     }
     this.coreU.uBass.value = bass;
     this.coreU.uTreble.value = treble;
-    this.coronaU.uSize.value = 6 + 0.8 * level + 0.5 * beat;
+    this.coronaU.uSizeBoost.value = 1.2 * level + 0.8 * beat;
+    this.coronaU.uBass.value = Math.min(1, bass);
     this.ringU.uMid.value = Math.min(1, mid);
     this.swarmU.uOrbit.value = this.orbit;
     this.swarmU.uBass.value = Math.min(1, bass);
@@ -602,7 +666,17 @@ export class PulseCore implements Preset {
     this.core.rotation.y += dt * 0.12 * p.speed;
     this.updateRings();
 
-    if (f.beat) this.spawnShockwave(f);
+    if (f.beat) {
+      this.spawnShockwave(f);
+      this.burstTime = 0;
+      this.burstSeed = (f.beatCount * 0.6180339887) % 1;
+      this.burstPower = 0.55 + 0.45 * Math.min(1, f.beatStrength);
+    } else if (this.burstTime < 9) {
+      this.burstTime += dt;
+    }
+    this.swarmU.uBurstTime.value = this.burstTime;
+    this.swarmU.uBurstSeed.value = this.burstSeed;
+    this.swarmU.uBurstPower.value = this.burstPower * k;
     this.advanceShockwaves(dt * p.speed);
   }
 
