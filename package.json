@@ -1,0 +1,25 @@
+{
+  "name": "resonance-vr",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Quest 2 ready WebXR music visualizer / player with 3D audio-reactive scenes",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc --noEmit",
+    "screens": "node tests/screenshots.mjs",
+    "check": "npm run typecheck && npm run build"
+  },
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.186.0",
+    "iwer": "^2.6.0",
+    "playwright": "^1.64.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.4"
+  }
+}
