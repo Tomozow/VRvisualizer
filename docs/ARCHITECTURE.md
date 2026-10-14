@@ -58,12 +58,17 @@ background layer, active presets) → `vrui.update(dt, t)` → `renderer.render`
 * Presets put everything inside `group`, never touch the camera, keep a 1 m sphere around (0, 1.6, 0) free, implement
   `setOpacity` by fading uniforms (not by toggling visibility), and `dispose()` resources.
 * GPU audio history: `ctx.textures.uniforms` (spread into your `uniforms`) + `HISTORY_GLSL` helpers
-  (`histFreq(u, age)`, `histWave(u, age)`) from `src/viz/shared/AudioTextures.ts`. 256 rows ≈ 3.5 s at 72 fps.
+  (`histFreq(u, age)`, `histWave(u, age)`, and pre-blurred `histFreqSmooth` / `histWaveSmooth` — one fetch instead of a
+  multi-tap blur) from `src/viz/shared/AudioTextures.ts`. One row per 1/72 s; 256 rows ≈ 3.5 s. Rows are uploaded
+  individually (`addUpdateRange`).
+* Output transform: use `cheapOutput(col)` / `cheapOutputAdditive(col)` from `src/viz/shared/Shading.ts` instead of three's
+  `<tonemapping_fragment>` + `<colorspace_fragment>` chunks (≈ 70 fewer ALU slots per fragment on Quest). Declare
+  `precision mediump float;` in fragment shaders that do not compute grid/fract coordinates.
 * Palette: sample `uGradient` (`ctx.palette.gradient`, 256×1) with a 0..1 value; `ctx.palette.primary/secondary/accent/background`
   are live `THREE.Color`s — reference them directly in uniforms, they ease automatically.
 * `VizParams`: `intensity` (0..2) scales amplitudes / reactivity, `speed` scales time, `glow` scales brightness/alpha.
 * Comfort: no camera motion; large slow motion only; avoid full-screen strobing (max flash contribution ≈ beatEnv*0.35).
-* Performance budget per preset on Quest 2 (quality 'medium'): ≤ 3 draw calls, ≤ 120k vertices, no post-processing,
+* Performance budget per preset on Quest 2 (quality 'medium'): ≤ 6 draw calls (≤ 3 preferred), ≤ 120k vertices, ≤ 8 ms GPU, no post-processing,
   no per-frame geometry re-upload beyond ~64 KB, no `MeshStandardMaterial` with many lights. Use `ShaderMaterial`,
   `InstancedMesh`, `Points`, additive blending, soft sprites (fake bloom), `depthWrite:false` for additive layers.
   Use `ctx.quality` to scale counts ('low' ×0.5, 'medium' ×1, 'high' ×2).

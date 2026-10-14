@@ -30,7 +30,7 @@ export interface PaletteState {
 
 /**
  * Shared GPU-side audio history. One ring-buffer row is written per frame.
- * Texture layout (both RedFormat, UnsignedByteType, NearestFilter on V, LinearFilter on U):
+ * Texture layout (RedFormat, UnsignedByteType, LinearFilter on both axes so fractional ages interpolate):
  *  - freqHistory: width = BAND_COUNT (128), height = HISTORY_ROWS; value = band energy 0..255
  *  - waveHistory: width = WAVE_COUNT (256), height = HISTORY_ROWS; value = (sample*0.5+0.5)*255
  * Row `uHistoryHead` (0..HISTORY_ROWS-1) is the newest; row (head - k) is k frames old (wrap around).
@@ -42,12 +42,17 @@ export const HISTORY_ROWS = 256;
 export interface AudioTextures {
   freqHistory: THREE.DataTexture;
   waveHistory: THREE.DataTexture;
+  /** Pre-blurred copies (5-band / 12-sample box + ≈3-row temporal average) for smooth profiles with one fetch */
+  freqSmooth: THREE.DataTexture;
+  waveSmooth: THREE.DataTexture;
   /** Newest row index (float for direct uniform use) */
   head: number;
   /** Shared uniforms object that presets can spread into their own materials */
   uniforms: {
     uFreqHistory: { value: THREE.DataTexture };
     uWaveHistory: { value: THREE.DataTexture };
+    uFreqSmooth: { value: THREE.DataTexture };
+    uWaveSmooth: { value: THREE.DataTexture };
     uHistoryHead: { value: number };
     uHistoryRows: { value: number };
   };

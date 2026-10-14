@@ -130,6 +130,7 @@ export class VisualizerManager {
     this.paletteCtl.update(dt);
     this.fog.color.copy(this.paletteCtl.state.background);
     this.ctx.textures.update(features, dt);
+    this.environment.setPixelRatio(this.opts.renderer.xr.isPresenting ? 1 : this.opts.renderer.getPixelRatio());
     this.environment.update(features, dt, t, params);
 
     this.background.group.visible = params.background;

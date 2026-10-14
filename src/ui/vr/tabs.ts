@@ -1,8 +1,10 @@
-import type { SourceKind, Track } from '@/audio/types';
-import { clamp, detectQuality } from '@/util/device';
+import type { Track } from '@/audio/types';
+import { KIND_LABEL, LABELS, formatTime } from '@/ui/labels';
+import { clamp } from '@/util/device';
+import type { QualityLevel } from '@/viz/types';
 import {
   COLOR, FS, circle, drawCard, drawIcon, drawKeycap, drawMeter, drawPaletteChip, drawSeekIcon, drawSliderTrack, drawSwitch,
-  drawText, fillRound, fitText, font, formatTime, hGradient, roundRectPath, strokeRound, wrapText, rgba,
+  drawText, fillRound, fitText, font, hGradient, keycapWidth, roundRectPath, strokeRound, wrapText, rgba,
   type IconName,
 } from './theme';
 import type { LiveLabel, TabEnv } from './ui';
@@ -22,13 +24,12 @@ const BOTTOM = 1244;
 /** A seek to the very end finishes the track; stay this far inside it. */
 const SEEK_END_MARGIN = 0.25;
 
-const KIND_LABEL: Record<SourceKind, string> = {
-  file: 'LOCAL FILE',
-  url: 'STREAM URL',
-  mic: 'MICROPHONE',
-  youtube: 'YOUTUBE',
-  demo: 'DEMO SIGNAL',
-};
+/** How long a destructive button stays armed ("tap again to confirm"). */
+const CONFIRM_MS = 3000;
+/** With at most this many tracks queued, the empty part of the queue column shows the controls legend. */
+const LEGEND_MAX_TRACKS = 2;
+/** Height of the compact "queue is empty" card of the Player tab. */
+const EMPTY_CARD_H = 270;
 
 // ---------------------------------------------------------------------------------------------
 // shared bits
@@ -113,7 +114,7 @@ function slider(
     commit(v);
   };
   env.widgets.add({
-    key, x: x - 36, y: cy - 46, w: w + 72, h: 92, r: 30,
+    key, x: x - 36, y: cy - 46, w: w + 72, h: 92, r: 30, track: { x, w },
     drag: (px, _py, phase) => {
       const raw = min + clamp((px - x) / w, 0, 1) * (max - min);
       const v = clamp(+(Math.round(raw / step) * step).toFixed(4), min, max);
@@ -128,6 +129,15 @@ function slider(
       }
     },
   });
+}
+
+function shorten(str: string, max: number): string {
+  return str.length > max ? `${str.slice(0, max - 1).trimEnd()}…` : str;
+}
+
+/** Elapsed-time read-out: the shared formatter shows "unknown" for 0, which is a real position here. */
+function elapsedText(seconds: number): string {
+  return seconds <= 0 ? '0:00' : formatTime(seconds);
 }
 
 function drawEqGlyph(env: TabEnv, cx: number, cy: number, color: string): void {
@@ -181,7 +191,8 @@ export function drawPlayer(env: TabEnv): void {
   let ty = TOP + 58;
   if (track) {
     ctx.font = font(FS.title, 800);
-    const lines = wrapText(ctx, track.title || 'Untitled', tw, 2);
+    // the amber "no sound" pill below needs the room of the second title line
+    const lines = wrapText(ctx, track.title || 'Untitled', tw, env.noSound ? 1 : 2);
     lines.forEach((ln, i) => drawText(ctx, ln, tx, ty + i * 66, FS.title, COLOR.text, { weight: 800 }));
     ty += lines.length * 66 + 6;
     if (track.artist) {
@@ -193,9 +204,18 @@ export function drawPlayer(env: TabEnv): void {
     ctx.font = font(FS.body, 600);
     drawText(ctx, fitText(ctx, 'Open Sources to start', tw), tx, ty + 66, FS.body, COLOR.textDim, { weight: 600 });
   }
-  // status pill (source kind / loading / error)
-  {
-    let text = track ? KIND_LABEL[track.kind] : 'IDLE';
+  // status pill (source kind / loading / error), or the amber "no sound" warning
+  if (env.noSound && pb.status !== 'loading' && pb.status !== 'error') {
+    ctx.font = font(FS.label, 700);
+    const lines = wrapText(ctx, LABELS.noSound, tw - 56, 2);
+    const lh = 50;
+    const ph = lines.length * lh + 26;
+    const py = TOP + 4 + thS - ph;
+    fillRound(ctx, tx, py, tw, ph, 32, 'rgba(255,196,87,0.14)');
+    strokeRound(ctx, tx + 1.5, py + 1.5, tw - 3, ph - 3, 31, 'rgba(255,196,87,0.7)', 3);
+    lines.forEach((ln, i) => drawText(ctx, ln, tx + 28, py + 13 + lh / 2 + i * lh + 1, FS.label, COLOR.warn, { weight: 700, baseline: 'middle' }));
+  } else {
+    let text = track ? KIND_LABEL[track.kind].toUpperCase() : 'IDLE';
     let col: string = a.mainCss;
     if (pb.status === 'loading') { text = 'LOADING…'; col = COLOR.warn; }
     else if (pb.status === 'error') { text = pb.message ? pb.message : 'ERROR'; col = COLOR.bad; }
@@ -230,12 +250,12 @@ export function drawPlayer(env: TabEnv): void {
       const held = env.hold('seek');
       return Math.floor(held !== undefined && seekable ? held * dur : env.playhead());
     },
-    text: (n) => (n === -1 ? '–:––' : n === -2 ? 'LIVE' : formatTime(n)),
+    text: (n) => (n === -1 ? LABELS.unknownDuration : n === -2 ? LABELS.live : elapsedText(n)),
   });
-  drawText(ctx, seekable ? formatTime(dur) : '–:––', LEFT + LW, barY + 2, FS.label, COLOR.textDim, { weight: 700, align: 'right', baseline: 'middle' });
+  drawText(ctx, seekable ? formatTime(dur) : LABELS.unknownDuration, LEFT + LW, barY + 2, FS.label, COLOR.textDim, { weight: 700, align: 'right', baseline: 'middle' });
   if (seekable) {
     env.widgets.add({
-      key: 'seek', x: barX - 36, y: barY - 50, w: barW + 72, h: 100, r: 32,
+      key: 'seek', x: barX - 36, y: barY - 50, w: barW + 72, h: 100, r: 32, track: { x: barX, w: barW },
       drag: (px, _py, phase) => {
         const f = clamp((px - barX) / barW, 0, 1);
         if (phase === 'end') {
@@ -256,7 +276,12 @@ export function drawPlayer(env: TabEnv): void {
   circleButton(env, { key: 'shuffle', cx: cx - 420, cy: ty0, r: 46, icon: 'shuffle', active: pb.shuffle, click: () => act.setShuffle(!pb.shuffle) });
   circleButton(env, { key: 'back10', cx: cx - 286, cy: ty0, r: 58, seek: -1, disabled: !seekable, click: () => act.seekBy(-10) });
   circleButton(env, { key: 'prev', cx: cx - 156, cy: ty0, r: 54, icon: 'prev', disabled: !can, click: () => act.prev() });
-  circleButton(env, { key: 'toggle', cx, cy: ty0, r: 80, icon: pb.playing ? 'pause' : 'play', primary: true, disabled: !can, click: () => act.toggle() });
+  // While the audio context never started, "playing" is only nominal: show ▶, and a tap starts the sound instead of pausing.
+  const stuck = env.soundStuck && pb.playing;
+  circleButton(env, {
+    key: 'toggle', cx, cy: ty0, r: 80, icon: pb.playing && !stuck ? 'pause' : 'play', primary: true, disabled: !can,
+    click: () => (stuck ? act.play() : act.toggle()),
+  });
   circleButton(env, { key: 'next', cx: cx + 156, cy: ty0, r: 54, icon: 'next', disabled: !can, click: () => act.next() });
   circleButton(env, { key: 'fwd10', cx: cx + 286, cy: ty0, r: 58, seek: 1, disabled: !seekable, click: () => act.seekBy(10) });
   const nextRepeat = pb.repeat === 'off' ? 'all' : pb.repeat === 'all' ? 'one' : 'off';
@@ -334,34 +359,49 @@ export function drawPlayer(env: TabEnv): void {
   }
   const maxTop = Math.max(0, total - ROWS);
   const top = clamp(env.local.queueTop ?? pb.index - 2, 0, maxTop);
+  // "Clear" is a two-step button: the first tap arms it (it grows to ask), the second one within CONFIRM_MS clears.
+  // The pager sits left of the widest (armed) Clear with a 24 px gap, so the button never moves it or touches it.
+  const CLEAR_ARMED_MAX_W = 300;
+  const pagerRight = QX + QW - CLEAR_ARMED_MAX_W - 24;
   if (total > ROWS) {
-    circleButton(env, { key: 'q-up', cx: QX + QW - 330, cy: headY, r: 34, icon: 'chevronUp', disabled: top <= 0, click: () => { env.local.queueTop = Math.max(0, top - 2); env.invalidate(); } });
-    circleButton(env, { key: 'q-down', cx: QX + QW - 242, cy: headY, r: 34, icon: 'chevronDown', disabled: top >= maxTop, click: () => { env.local.queueTop = Math.min(maxTop, top + 2); env.invalidate(); } });
+    circleButton(env, { key: 'q-down', cx: pagerRight - 42, cy: headY, r: 34, icon: 'chevronDown', disabled: top >= maxTop, click: () => { env.local.queueTop = Math.min(maxTop, top + 2); env.invalidate(); } });
+    circleButton(env, { key: 'q-up', cx: pagerRight - 42 - 88, cy: headY, r: 34, icon: 'chevronUp', disabled: top <= 0, click: () => { env.local.queueTop = Math.max(0, top - 2); env.invalidate(); } });
   }
   if (total > 0) {
-    const bw = 168;
-    const bh = 72;
+    const armed = env.hold('q-clear') === 1;
+    ctx.font = font(FS.label, 700);
+    const lines = armed ? ['Clear all?', 'Tap again'] : ['Clear'];
+    const bw = armed ? Math.min(CLEAR_ARMED_MAX_W, Math.ceil(Math.max(...lines.map((l) => ctx.measureText(l).width))) + 56) : 168;
+    const bh = armed ? 100 : 72;
     const bx = QX + QW - bw;
-    fillRound(ctx, bx, headY - bh / 2, bw, bh, bh / 2, 'rgba(255,255,255,0.09)');
-    strokeRound(ctx, bx + 1.5, headY - bh / 2 + 1.5, bw - 3, bh - 3, bh / 2 - 1, 'rgba(255,255,255,0.16)', 2);
-    drawText(ctx, 'Clear', bx + bw / 2, headY + 2, FS.label, COLOR.text, { weight: 700, align: 'center', baseline: 'middle' });
-    hit(env, 'q-clear', bx, headY - bh / 2, bw, bh, bh / 2, () => act.clearQueue());
+    const by = headY - bh / 2;
+    fillRound(ctx, bx, by, bw, bh, armed ? 36 : bh / 2, armed ? 'rgba(255,107,129,0.2)' : 'rgba(255,255,255,0.09)');
+    strokeRound(ctx, bx + 1.5, by + 1.5, bw - 3, bh - 3, armed ? 35 : bh / 2 - 1, armed ? COLOR.bad : 'rgba(255,255,255,0.16)', armed ? 3 : 2);
+    lines.forEach((ln, i) => drawText(ctx, ln, bx + bw / 2, headY + 2 + (i - (lines.length - 1) / 2) * 46, FS.label, armed ? '#ffffff' : COLOR.text, { weight: 700, align: 'center', baseline: 'middle' }));
+    hit(env, 'q-clear', bx, by, bw, bh, armed ? 36 : bh / 2, () => {
+      if (env.hold('q-clear') === 1) {
+        env.setHold('q-clear', 0, 1);
+        act.clearQueue();
+      } else {
+        env.setHold('q-clear', 1, CONFIRM_MS);
+        env.invalidateIn(CONFIRM_MS);
+      }
+    });
   }
 
   if (total === 0) {
-    drawCard(ctx, QX, RY - 4, QW, BOTTOM - RY + 4, 30);
-    drawIcon(ctx, 'note', QX + QW / 2, RY + 250, 160, 'rgba(255,255,255,0.22)');
-    ctx.font = font(52, 800);
-    const lines = wrapText(ctx, 'Nothing playing — open Sources', QW - 140, 2);
-    lines.forEach((ln, i) => drawText(ctx, ln, QX + QW / 2, RY + 436 + i * 64, 52, COLOR.text, { weight: 800, align: 'center' }));
-    const bw = 480;
-    const bh = 112;
+    // compact empty state; the legend below fills the rest of the column
+    drawCard(ctx, QX, RY - 4, QW, EMPTY_CARD_H, 30);
+    drawIcon(ctx, 'note', QX + 96, RY + 56, 96, 'rgba(255,255,255,0.28)');
+    drawText(ctx, 'Nothing queued', QX + 176, RY + 62, FS.title, COLOR.text, { weight: 800 });
+    drawText(ctx, 'Add music in Sources', QX + 176, RY + 112, FS.body, COLOR.textDim, { weight: 600 });
+    const bw = 440;
+    const bh = 84;
     const bx = QX + (QW - bw) / 2;
-    const by = RY + 580;
+    const by = RY - 4 + EMPTY_CARD_H - bh - 24;
     fillRound(ctx, bx, by, bw, bh, bh / 2, hGradient(ctx, bx, bx + bw, a.mainCss, a.altCss));
     drawText(ctx, 'Open Sources', bx + bw / 2, by + bh / 2 + 2, FS.body, a.ink, { weight: 800, align: 'center', baseline: 'middle' });
     hit(env, 'open-sources', bx, by, bw, bh, bh / 2, () => act.setTab('sources'));
-    return;
   }
 
   for (let r = 0; r < ROWS && top + r < total; r++) {
@@ -387,10 +427,19 @@ export function drawPlayer(env: TabEnv): void {
     drawText(ctx, fitText(ctx, sub, textW - durW), textX, y + 116, FS.label, COLOR.textFaint, { weight: 600 });
     drawIcon(ctx, 'close', QX + QW - 60, midY, 44, COLOR.textDim);
     hit(env, `q-row-${i}`, QX, y, QW - 120, RH, 26, () => (current ? act.toggle() : act.play(i)));
-    hit(env, `q-del-${i}`, QX + QW - 120, y + 14, 106, RH - 28, 26, () => act.removeTrack(i));
+    hit(env, `q-del-${i}`, QX + QW - 120, y + 14, 106, RH - 28, 26, () => {
+      act.removeTrack(i);
+      act.toast(`Removed '${shorten(t.title || 'Untitled', 30)}'`, 2200);
+    });
   }
   if (total > ROWS) {
     drawText(ctx, `${top + 1}–${Math.min(total, top + ROWS)} of ${total}`, QX + QW / 2, RY + ROWS * (RH + GAP) + 38, FS.label, COLOR.textDim, { weight: 700, align: 'center' });
+  }
+
+  // a short queue leaves most of the column empty: use it to teach the controller mapping
+  if (total <= LEGEND_MAX_TRACKS) {
+    const ly = total === 0 ? RY - 4 + EMPTY_CARD_H + 20 : RY + total * (RH + GAP);
+    drawControls(env, QX, ly, QW, BOTTOM - ly, true);
   }
 }
 
@@ -478,9 +527,9 @@ export function drawScenes(env: TabEnv): void {
   // sliders (fill, knob and value are live overlays)
   sectionLabel(env, 'TUNING', RX, TOP + 36);
   const sliders: { key: string; label: string; min: number; max: number; k: 'intensity' | 'speed' | 'glow' }[] = [
-    { key: 'intensity', label: 'Intensity', min: 0, max: 2, k: 'intensity' },
-    { key: 'speed', label: 'Speed', min: 0, max: 2, k: 'speed' },
-    { key: 'glow', label: 'Glow', min: 0, max: 1, k: 'glow' },
+    { key: 'intensity', label: LABELS.intensity, min: 0, max: 2, k: 'intensity' },
+    { key: 'speed', label: LABELS.speed, min: 0, max: 2, k: 'speed' },
+    { key: 'glow', label: LABELS.glow, min: 0, max: 1, k: 'glow' },
   ];
   sliders.forEach((sl, i) => {
     const top = y0 + i * 156;
@@ -497,8 +546,8 @@ export function drawScenes(env: TabEnv): void {
   const tgY = y0 + 3 * 156 + 6;
   const tgH = 104;
   const toggles: { key: string; label: string; on: boolean; click: () => void }[] = [
-    { key: 'autocycle', label: 'Auto-cycle', on: s.autoCycle, click: () => act.setAutoCycle(!s.autoCycle) },
-    { key: 'background', label: 'Background', on: s.params.background, click: () => act.setParam('background', !s.params.background) },
+    { key: 'autocycle', label: LABELS.autoCycle, on: s.autoCycle, click: () => act.setAutoCycle(!s.autoCycle) },
+    { key: 'background', label: LABELS.background, on: s.params.background, click: () => act.setParam('background', !s.params.background) },
   ];
   toggles.forEach((t, i) => {
     const ty = tgY + i * (tgH + 16);
@@ -538,25 +587,47 @@ export function drawSources(env: TabEnv): void {
   const micOn = pb.micEnabled;
   const silent = features.silence;
 
-  // microphone tile
-  bigTile(env, 'mic', LEFT, TOP, TWID, TH, micOn, () => (micOn ? act.disableMic() : act.enableMic()));
+  // microphone tile. YouTube visuals are analysed through the microphone, so turning it off there takes a second tap.
+  const ytActive = !!pb.track && pb.track.kind === 'youtube';
+  const micArmed = micOn && ytActive && env.hold('mic-off') === 1;
+  bigTile(env, 'mic', LEFT, TOP, TWID, TH, micOn, () => {
+    if (!micOn) {
+      act.enableMic();
+    } else if (ytActive && env.hold('mic-off') !== 1) {
+      env.setHold('mic-off', 1, CONFIRM_MS);
+      env.invalidateIn(CONFIRM_MS);
+    } else {
+      env.setHold('mic-off', 0, 1);
+      act.disableMic();
+    }
+  });
   circle(ctx, LEFT + 104, TOP + 96, 56, micOn ? hGradient(ctx, LEFT + 48, LEFT + 160, a.mainCss, a.altCss) : 'rgba(255,255,255,0.09)');
   drawIcon(ctx, 'mic', LEFT + 104, TOP + 96, 62, micOn ? a.ink : COLOR.text);
-  drawText(ctx, micOn ? 'Microphone on' : 'Microphone off', LEFT + 196, TOP + 88, FS.title, COLOR.text, { weight: 800 });
-  const micStatus = micOn ? (silent ? 'No signal yet' : 'Listening') : 'Tap to turn on';
-  drawText(ctx, micStatus, LEFT + 196, TOP + 148, FS.body, micOn ? (silent ? COLOR.warn : COLOR.good) : COLOR.textDim, { weight: 600 });
+  drawText(ctx, micOn ? LABELS.micOn : LABELS.micOff, LEFT + 196, TOP + 88, FS.title, COLOR.text, { weight: 800 });
+  let micStatus = micOn ? (silent ? 'No signal yet' : 'Listening') : 'Tap to turn on';
+  let micCol: string = micOn ? (silent ? COLOR.warn : COLOR.good) : COLOR.textDim;
+  if (micArmed) {
+    micStatus = 'Tap again to turn off';
+    micCol = COLOR.warn;
+  } else if (ytActive) {
+    micStatus = 'Required for YouTube visuals';
+    micCol = micOn ? COLOR.textDim : COLOR.warn;
+  }
+  ctx.font = font(FS.body, 600);
+  drawText(ctx, fitText(ctx, micStatus, TWID - 196 - 30), LEFT + 196, TOP + 148, FS.body, micCol, { weight: 600 });
   const lvlW = sectionLabel(env, 'LEVEL', LEFT + 40, TOP + 250);
   const meterX = LEFT + 40 + lvlW + 28;
   drawMeter(ctx, meterX, TOP + 220, LEFT + TWID - 40 - meterX, 40, features.level, 24, a);
 
-  // demo tile
+  // demo tile: starts the demo track, and pauses it while it plays
   const dx = RIGHT - TWID;
   const demoPlaying = !!pb.track && pb.track.kind === 'demo' && pb.playing;
-  bigTile(env, 'demo', dx, TOP, TWID, TH, demoPlaying, () => act.startDemo());
+  bigTile(env, 'demo', dx, TOP, TWID, TH, demoPlaying, () => (demoPlaying ? act.pause() : act.startDemo()));
   circle(ctx, dx + 104, TOP + 96, 56, demoPlaying ? hGradient(ctx, dx + 48, dx + 160, a.mainCss, a.altCss) : 'rgba(255,255,255,0.09)');
   drawIcon(ctx, demoPlaying ? 'pause' : 'play', dx + 104, TOP + 96, 62, demoPlaying ? a.ink : COLOR.text);
-  drawText(ctx, 'Demo track', dx + 196, TOP + 88, FS.title, COLOR.text, { weight: 800 });
-  drawText(ctx, demoPlaying ? 'Playing now' : 'Tap to start', dx + 196, TOP + 148, FS.body, demoPlaying ? COLOR.good : COLOR.textDim, { weight: 600 });
+  ctx.font = font(FS.title, 800);
+  drawText(ctx, fitText(ctx, demoPlaying ? KIND_LABEL.demo : LABELS.demoButton, TWID - 196 - 30), dx + 196, TOP + 88, FS.title, COLOR.text, { weight: 800 });
+  drawText(ctx, demoPlaying ? 'Playing · tap to pause' : 'Tap to start', dx + 196, TOP + 148, FS.body, demoPlaying ? COLOR.good : COLOR.textDim, { weight: 600 });
   ctx.font = font(FS.body, 600);
   wrapText(ctx, 'Built-in music at about 124 BPM, works offline.', TWID - 80, 2)
     .forEach((ln, i) => drawText(ctx, ln, dx + 40, TOP + 220 + i * 54, FS.body, COLOR.textDim, { weight: 600 }));
@@ -634,109 +705,166 @@ const LEGEND: LegendRow[] = [
   { caps: ['STICK'], arrows: 'lr', text: 'Previous / next scene' },
   { caps: ['STICK'], arrows: 'ud', text: 'Volume down / up' },
   { caps: ['A', 'X'], text: 'Play / pause' },
-  { caps: ['B', 'Y'], text: 'Show / hide menu' },
+  { caps: ['B', 'Y'], text: 'Show / hide · hold to recenter' },
 ];
 
-let qualityLabel = '';
+/** The controller legend card (Settings, and the Player tab while the queue leaves room). `compact` trades size for fit. */
+function drawControls(env: TabEnv, x: number, y: number, w: number, h: number, compact: boolean): void {
+  const { ctx, accent: a } = env;
+  drawCard(ctx, x, y, w, h, 30);
+  sectionLabel(env, 'CONTROLS', x + 44, y + (compact ? 66 : 76));
+  const rowsTop = y + (compact ? 92 : 115);
+  const rowH = Math.min(134, (y + h - 18 - rowsTop) / LEGEND.length);
+  const capPad = compact ? 24 : 40;
+  const capGap = compact ? 22 : 28;
+  const ARROWS_W = 113;
+  // the text column starts right of the widest key-cap group
+  let capsW = 0;
+  for (const row of LEGEND) {
+    const caps = row.caps.reduce((sum, c, i) => sum + keycapWidth(ctx, c, capPad) + (i > 0 ? capGap : 0), 0);
+    capsW = Math.max(capsW, caps + (row.arrows ? ARROWS_W : 0));
+  }
+  const textX = x + 44 + capsW + (compact ? 26 : 34);
+  const textSize = rowH >= 120 ? FS.body : FS.label;
+  const pitch = textSize === FS.body ? 54 : 46;
+  LEGEND.forEach((row, i) => {
+    const cy = rowsTop + rowH * (i + 0.5);
+    if (i > 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.07)';
+      ctx.fillRect(x + 44, cy - rowH / 2, w - 88, 2);
+    }
+    let cx = x + 44;
+    row.caps.forEach((c, ci) => {
+      if (ci > 0) {
+        drawText(ctx, '/', cx + capGap / 2, cy + 2, FS.label, COLOR.textFaint, { weight: 600, align: 'center', baseline: 'middle' });
+        cx += capGap;
+      }
+      cx += drawKeycap(ctx, cx, cy, c, a, capPad);
+    });
+    if (row.arrows) {
+      const [i1, i2]: [IconName, IconName] = row.arrows === 'lr' ? ['chevronLeft', 'chevronRight'] : ['chevronDown', 'chevronUp'];
+      drawIcon(ctx, i1, cx + 34, cy, 54, a.mainCss);
+      drawIcon(ctx, i2, cx + 34 + 52, cy, 54, a.mainCss);
+    }
+    ctx.font = font(textSize, 600);
+    const lines = wrapText(ctx, row.text, x + w - 40 - textX, 2);
+    lines.forEach((ln, li) => drawText(ctx, ln, textX, cy + (li - (lines.length - 1) / 2) * pitch + 2, textSize, COLOR.text, { weight: 600, baseline: 'middle' }));
+  });
+}
+
+interface ActionRow {
+  key: string;
+  y: number;
+  h: number;
+  icon: IconName;
+  iconColor: string;
+  title: string;
+  sub: string;
+  tint?: string;
+  disabled?: boolean;
+  click: () => void;
+}
+
+/** A full-width settings card: icon disc, title, one line of explanation, tap anywhere. */
+function actionRow(env: TabEnv, w: number, o: ActionRow): void {
+  const { ctx } = env;
+  ctx.save();
+  if (o.disabled) ctx.globalAlpha = 0.5;
+  drawCard(ctx, LEFT, o.y, w, o.h, 30, o.tint);
+  circle(ctx, LEFT + 84, o.y + o.h / 2, 44, 'rgba(255,255,255,0.09)');
+  drawIcon(ctx, o.icon, LEFT + 84, o.y + o.h / 2, 52, o.iconColor);
+  drawText(ctx, o.title, LEFT + 168, o.y + o.h / 2 - 4, 52, COLOR.text, { weight: 800 });
+  ctx.font = font(FS.label, 600);
+  drawText(ctx, fitText(ctx, o.sub, w - 168 - 28), LEFT + 168, o.y + o.h / 2 + 42, FS.label, COLOR.textDim, { weight: 600 });
+  ctx.restore();
+  if (!o.disabled) hit(env, o.key, LEFT, o.y, w, o.h, 30, o.click);
+}
+
+/** Pill-shaped choice between a few labels; each segment is its own hit target. */
+function drawSegmented(
+  env: TabEnv, key: string, x: number, y: number, w: number, h: number, labels: readonly string[], active: number, pick: (i: number) => void,
+): void {
+  const { ctx, accent: a } = env;
+  fillRound(ctx, x, y, w, h, h / 2, 'rgba(255,255,255,0.07)');
+  strokeRound(ctx, x + 1.5, y + 1.5, w - 3, h - 3, h / 2 - 1, COLOR.stroke, 2);
+  const inset = 7;
+  const sw = (w - inset * 2) / labels.length;
+  labels.forEach((label, i) => {
+    const sx = x + inset + i * sw;
+    const on = i === active;
+    if (on) fillRound(ctx, sx, y + inset, sw, h - inset * 2, (h - inset * 2) / 2, hGradient(ctx, sx, sx + sw, a.mainCss, a.altCss));
+    drawText(ctx, label, sx + sw / 2, y + h / 2 + 2, FS.body, on ? a.ink : COLOR.text, { weight: on ? 800 : 600, align: 'center', baseline: 'middle' });
+    hit(env, `${key}-${i}`, sx, y, sw, h, h / 2, () => pick(i));
+  });
+}
+
+const QUALITY_LEVELS: readonly { id: QualityLevel; label: string }[] = [
+  { id: 'low', label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high', label: 'High' },
+];
 
 export function drawSettings(env: TabEnv): void {
   const { ctx, state: s, actions: act, accent: a } = env;
   const LW = 860;
-  const info = env.renderInfo();
+  const bh = 136;
+  const gap = 16;
 
-  // Recenter
-  const bh = 132;
-  const gap = 18;
-  drawCard(ctx, LEFT, TOP, LW, bh, 30);
-  circle(ctx, LEFT + 84, TOP + bh / 2, 44, 'rgba(255,255,255,0.09)');
-  drawIcon(ctx, 'recenter', LEFT + 84, TOP + bh / 2, 52, a.mainCss);
-  drawText(ctx, 'Recenter menu', LEFT + 168, TOP + 62, 52, COLOR.text, { weight: 800 });
-  drawText(ctx, 'Place it in front of you', LEFT + 168, TOP + 108, FS.label, COLOR.textDim, { weight: 600 });
-  hit(env, 'recenter', LEFT, TOP, LW, bh, 30, () => act.recenter());
-
-  // Exit / enter VR
-  const ey = TOP + bh + gap;
   const inXr = s.mode === 'xr';
   const canEnter = inXr || s.xrSupported;
-  ctx.save();
-  if (!canEnter) ctx.globalAlpha = 0.5;
-  drawCard(ctx, LEFT, ey, LW, bh, 30, inXr ? 'rgba(255,107,129,0.11)' : undefined);
-  circle(ctx, LEFT + 84, ey + bh / 2, 44, 'rgba(255,255,255,0.09)');
-  drawIcon(ctx, inXr ? 'exit' : 'headset', LEFT + 84, ey + bh / 2, 52, inXr ? COLOR.bad : a.mainCss);
-  drawText(ctx, inXr ? 'Exit VR' : 'Enter VR', LEFT + 168, ey + 62, 52, COLOR.text, { weight: 800 });
-  ctx.font = font(FS.label, 600);
-  drawText(ctx, fitText(ctx, inXr ? 'Return to the 2D page' : canEnter ? 'Start an immersive session' : 'WebXR is not available here', LW - 168 - 28), LEFT + 168, ey + 108, FS.label, COLOR.textDim, { weight: 600 });
-  ctx.restore();
-  if (canEnter) hit(env, 'vr', LEFT, ey, LW, bh, 30, () => act.enterVR());
+  let y = TOP;
+  actionRow(env, LW, {
+    key: 'recenter', y, h: bh, icon: 'recenter', iconColor: a.mainCss, title: 'Recenter menu', sub: 'Place it in front of you',
+    click: () => act.recenter(),
+  });
+  y += bh + gap;
+  actionRow(env, LW, {
+    key: 'vr', y, h: bh, icon: inXr ? 'exit' : 'headset', iconColor: inXr ? COLOR.bad : a.mainCss, title: inXr ? 'Exit VR' : 'Enter VR',
+    sub: inXr ? 'Return to the 2D page' : canEnter ? 'Start an immersive session' : 'WebXR is not available here',
+    tint: inXr ? 'rgba(255,107,129,0.11)' : undefined, disabled: !canEnter, click: () => act.enterVR(),
+  });
+  y += bh + gap;
 
   // Auto-hide
-  const ay = ey + bh + gap;
-  const ah = 132;
-  drawCard(ctx, LEFT, ay, LW, ah, 30);
-  drawText(ctx, 'Auto-hide menu', LEFT + 40, ay + 62, FS.body, COLOR.text, { weight: 700 });
+  drawCard(ctx, LEFT, y, LW, bh, 30);
+  drawText(ctx, 'Auto-hide menu', LEFT + 40, y + bh / 2 - 4, FS.body, COLOR.text, { weight: 700 });
   ctx.font = font(FS.label, 600);
-  drawText(ctx, fitText(ctx, 'After 12 s without input', LW - 40 - 190), LEFT + 40, ay + 108, FS.label, COLOR.textDim, { weight: 600 });
-  drawSwitch(ctx, LEFT + LW - 112 - 36, ay + ah / 2, env.autoHide, a);
-  hit(env, 'autohide', LEFT, ay, LW, ah, 30, () => env.setAutoHide(!env.autoHide));
+  drawText(ctx, fitText(ctx, 'After 12 s without input', LW - 40 - 190), LEFT + 40, y + bh / 2 + 42, FS.label, COLOR.textDim, { weight: 600 });
+  drawSwitch(ctx, LEFT + LW - 112 - 36, y + bh / 2, env.autoHide, a);
+  hit(env, 'autohide', LEFT, y, LW, bh, 30, () => env.setAutoHide(!env.autoHide));
+  y += bh + gap;
 
-  // Performance
-  const py = ay + ah + gap;
-  const ph = BOTTOM - py;
-  drawCard(ctx, LEFT, py, LW, ph, 30);
-  sectionLabel(env, 'PERFORMANCE', LEFT + 40, py + 68);
-  const target = env.presenting ? (info.frameRate || 72) : 60;
+  // Hide now (hand-tracking users have no B / Y button)
+  actionRow(env, LW, {
+    key: 'hide', y, h: bh, icon: 'close', iconColor: a.mainCss, title: 'Hide menu', sub: 'Pinch or B / Y brings it back',
+    click: () => env.hideMenu(),
+  });
+  y += bh + gap;
+
+  // Quality, with the frame rate as a small corner read-out
+  const qh = BOTTOM - y;
+  drawCard(ctx, LEFT, y, LW, qh, 30);
+  sectionLabel(env, 'QUALITY', LEFT + 40, y + 68);
+  const target = env.presenting ? (env.renderInfo().frameRate || 72) : 60;
   const ratio = s.fps / target;
   const fpsCol = s.fps <= 0 ? COLOR.textDim : ratio >= 0.92 ? COLOR.good : ratio >= 0.7 ? COLOR.warn : COLOR.bad;
-  ctx.font = font(150, 800);
-  const fpsText = s.fps > 0 ? String(s.fps) : '–';
-  const fw = ctx.measureText(fpsText).width;
-  drawText(ctx, fpsText, LEFT + 40, py + 226, 150, fpsCol, { weight: 800 });
-  drawText(ctx, 'FPS', LEFT + 40 + fw + 24, py + 222, FS.body, COLOR.textDim, { weight: 700 });
-  if (!qualityLabel) qualityLabel = detectQuality().toUpperCase();
-  const perf: { k: string; v: string }[] = [
-    { k: 'Quality', v: qualityLabel },
-    { k: 'Display', v: env.presenting ? `${info.frameRate || 72} Hz headset` : 'Desktop window' },
-    { k: 'Draw calls', v: String(info.calls) },
-    { k: 'Triangles', v: info.triangles >= 1000 ? `${(info.triangles / 1000).toFixed(info.triangles >= 100000 ? 0 : 1)}k` : String(info.triangles) },
-  ];
-  perf.forEach((r, i) => {
-    const ry = py + 316 + i * 68;
-    drawText(ctx, r.k, LEFT + 40, ry, FS.label, COLOR.textFaint, { weight: 700, baseline: 'middle' });
-    drawText(ctx, r.v, LEFT + LW - 40, ry, FS.body, COLOR.text, { weight: 700, align: 'right', baseline: 'middle' });
+  drawText(ctx, s.fps > 0 ? `${s.fps} FPS` : '– FPS', LEFT + LW - 40, y + 68, FS.label, fpsCol, { weight: 800, align: 'right' });
+  const activeLevel = Math.max(0, QUALITY_LEVELS.findIndex((q) => q.id === s.quality));
+  drawSegmented(env, 'quality', LEFT + 40, y + 104, LW - 80, 112, QUALITY_LEVELS.map((q) => q.label), activeLevel, (i) => {
+    const q = QUALITY_LEVELS[i].id;
+    if (q === s.quality) return;
+    act.setQuality(q);
+    act.toast('Rebuilding scene…', 2500);
   });
+  ctx.font = font(FS.label, 600);
+  drawText(ctx, fitText(ctx, 'Changing it rebuilds the scene.', LW - 80), LEFT + 40, y + 104 + 112 + 56, FS.label, COLOR.textDim, { weight: 600 });
+  drawText(ctx, fitText(ctx, 'Medium is tuned for Quest 2.', LW - 80), LEFT + 40, y + 104 + 112 + 106, FS.label, COLOR.textFaint, { weight: 600 });
 
   // Controls legend
   const lx = LEFT + LW + 40;
   const lw = RIGHT - lx;
   const lh = BOTTOM - TOP;
-  drawCard(ctx, lx, TOP, lw, lh, 30);
-  sectionLabel(env, 'CONTROLS', lx + 44, TOP + 76);
-  const rowH = 134;
-  const textX = lx + 44 + 490;
-  LEGEND.forEach((row, i) => {
-    const cy = TOP + 182 + i * rowH;
-    if (i > 0) {
-      ctx.fillStyle = 'rgba(255,255,255,0.07)';
-      ctx.fillRect(lx + 44, cy - rowH / 2, lw - 88, 2);
-    }
-    let x = lx + 44;
-    row.caps.forEach((c, ci) => {
-      if (ci > 0) {
-        drawText(ctx, '/', x + 14, cy + 2, FS.label, COLOR.textFaint, { weight: 600, align: 'center', baseline: 'middle' });
-        x += 28;
-      }
-      x += drawKeycap(ctx, x, cy, c, a);
-    });
-    if (row.arrows) {
-      const [i1, i2]: [IconName, IconName] = row.arrows === 'lr' ? ['chevronLeft', 'chevronRight'] : ['chevronDown', 'chevronUp'];
-      drawIcon(ctx, i1, x + 34, cy, 54, a.mainCss);
-      drawIcon(ctx, i2, x + 34 + 52, cy, 54, a.mainCss);
-    }
-    ctx.font = font(FS.body, 600);
-    const avail = lx + lw - 40 - textX;
-    const lines = wrapText(ctx, row.text, avail, 2);
-    lines.forEach((ln, li) => drawText(ctx, ln, textX, cy + (lines.length === 1 ? 2 : li * 54 - 25), FS.body, COLOR.text, { weight: 600, baseline: 'middle' }));
-  });
+  drawControls(env, lx, TOP, lw, lh, false);
   ctx.font = font(FS.body, 600);
   wrapText(ctx, 'Hand tracking: point at the menu and pinch to click.', lw - 88, 2)
     .forEach((ln, i) => drawText(ctx, ln, lx + 44, TOP + lh - 84 + i * 56, FS.body, COLOR.textDim, { weight: 600 }));

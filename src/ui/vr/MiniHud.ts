@@ -1,13 +1,18 @@
 import * as THREE from 'three';
 import type { Store } from '@/app/Store';
-import type { AudioFeatures, SourceKind } from '@/audio/types';
+import type { AudioFeatures } from '@/audio/types';
+import { KIND_LABEL, LABELS } from '@/ui/labels';
 import { clamp, damp } from '@/util/device';
-import { COLOR, FS, MM_PER_PX, drawText, fillRound, fitText, font, strokeRound, type Accent } from './theme';
+import {
+  COLOR, FS, MM_PER_PX, drawKeycap, drawText, fillRound, fitText, font, keycapWidth, strokeRound, wrapText, type Accent,
+} from './theme';
 
-const HUD_PX_W = 1024;
+const HUD_PX_W = 1280;
 const HUD_PX_H = 176;
 const TOAST_PX_W = 1024;
-const TOAST_PX_H = 128;
+/** Room for two lines of text: a toast is drawn bottom-aligned, right above the HUD */
+const TOAST_PX_H = 192;
+const TOAST_LINE_H = 58;
 // Same pixel density as the menu panel (≈ 0.68 mm per px), so 44–52 px type is ≥ 1.2° at 1.4 m.
 const HUD_M_W = (HUD_PX_W * MM_PER_PX) / 1000;
 const HUD_M_H = (HUD_PX_H * MM_PER_PX) / 1000;
@@ -22,14 +27,6 @@ const HUD_PITCH_MENU_OPEN = THREE.MathUtils.degToRad(17);
 /** Lazy follow: the HUD ignores head yaw inside this cone, then eases after the head. */
 const FOLLOW_DEAD_ZONE = THREE.MathUtils.degToRad(18);
 const FOLLOW_RATE = 3.2;
-
-const KIND_LABEL: Record<SourceKind, string> = {
-  file: 'Local file',
-  url: 'Stream',
-  mic: 'Microphone',
-  youtube: 'YouTube',
-  demo: 'Demo signal',
-};
 
 /** A small canvas-textured quad that fades in and out. */
 class HudLabel {
@@ -92,6 +89,10 @@ export interface MiniHudFrame {
   menuVisible: boolean;
   /** HUD / toast are allowed to render at all (VR session, or debug flag on desktop) */
   enabled: boolean;
+  /** Playing but silent for a while: the subtitle says so */
+  noSound: boolean;
+  /** Only hands are tracked: the key cap says PINCH instead of B/Y */
+  handsOnly: boolean;
   accent: Accent;
   accentColor: THREE.Color;
 }
@@ -118,6 +119,8 @@ export class MiniHud {
   private shownTitle = '';
   private shownArtist: string | undefined = '';
   private shownAccent = '';
+  private shownNoSound = false;
+  private shownCap = '';
   private toastRef: object | null = null;
   private toastText = '';
   private toastUntil = 0;
@@ -155,15 +158,18 @@ export class MiniHud {
     const fresh = now - this.trackChangedAt < SHOW_AFTER_TRACK_CHANGE_MS;
     const wantHud = f.enabled && !!track && ((pb.playing && !f.menuVisible) || fresh);
     if (track && (wantHud || this.hud.opacity > 0.01)) {
+      const cap = f.handsOnly ? 'PINCH · MENU' : 'B/Y · MENU';
       if (
         track.id !== this.shownTrackId || track.title !== this.shownTitle || track.artist !== this.shownArtist ||
-        f.accent.mainCss !== this.shownAccent
+        f.accent.mainCss !== this.shownAccent || f.noSound !== this.shownNoSound || cap !== this.shownCap
       ) {
         this.shownTrackId = track.id;
         this.shownTitle = track.title;
         this.shownArtist = track.artist;
         this.shownAccent = f.accent.mainCss;
-        this.drawHud(track.title, track.artist || KIND_LABEL[track.kind], f.accent);
+        this.shownNoSound = f.noSound;
+        this.shownCap = cap;
+        this.drawHud(track.title, f.noSound ? LABELS.noSound : track.artist || KIND_LABEL[track.kind], f.noSound, cap, f.accent);
       }
     }
     const hudLevel = this.hud.fade(wantHud ? 1 : 0, dt);
@@ -221,7 +227,7 @@ export class MiniHud {
     this.group.rotation.set(clamp(this.pitch, -0.5, 0.5), this.followYaw, 0);
   }
 
-  private drawHud(title: string, subtitle: string, a: Accent): void {
+  private drawHud(title: string, subtitle: string, warn: boolean, cap: string, a: Accent): void {
     const ctx = this.hud.ctx;
     ctx.clearRect(0, 0, HUD_PX_W, HUD_PX_H);
     fillRound(ctx, 8, 8, HUD_PX_W - 16, HUD_PX_H - 16, 44, 'rgba(8,9,20,0.9)');
@@ -231,12 +237,14 @@ export class MiniHud {
     ctx.strokeStyle = 'rgba(255,255,255,0.25)';
     ctx.lineWidth = 3;
     ctx.stroke();
+    // The menu hint sits top-right, level with the title, so the subtitle below can use the full width.
+    const capW = keycapWidth(ctx, cap);
+    drawKeycap(ctx, HUD_PX_W - 40 - capW, 62, cap, a);
     const x = 118;
-    const w = HUD_PX_W - x - 44;
     ctx.font = font(52, 800);
-    drawText(ctx, fitText(ctx, title || 'Untitled', w), x, 80, 52, COLOR.text, { weight: 800 });
+    drawText(ctx, fitText(ctx, title || 'Untitled', HUD_PX_W - 40 - capW - 28 - x), x, 80, 52, COLOR.text, { weight: 800 });
     ctx.font = font(FS.label, 600);
-    drawText(ctx, fitText(ctx, subtitle, w), x, 138, FS.label, COLOR.textDim, { weight: 600 });
+    drawText(ctx, fitText(ctx, subtitle, HUD_PX_W - x - 44), x, 138, FS.label, warn ? COLOR.warn : COLOR.textDim, { weight: warn ? 700 : 600 });
     this.hud.upload();
   }
 
@@ -244,13 +252,18 @@ export class MiniHud {
     const ctx = this.toast.ctx;
     ctx.clearRect(0, 0, TOAST_PX_W, TOAST_PX_H);
     ctx.font = font(FS.body, 700);
-    const label = fitText(ctx, text, TOAST_PX_W - 160);
-    const tw = Math.ceil(ctx.measureText(label).width);
+    const lines = wrapText(ctx, text, TOAST_PX_W - 160, 2);
+    const tw = Math.ceil(Math.max(...lines.map((l) => ctx.measureText(l).width)));
     const pw = Math.max(220, tw + 90);
+    const ph = lines.length === 1 ? 104 : lines.length * TOAST_LINE_H + 46;
     const px = (TOAST_PX_W - pw) / 2;
-    fillRound(ctx, px, 12, pw, TOAST_PX_H - 24, 40, 'rgba(8,9,20,0.92)');
-    strokeRound(ctx, px + 1.5, 13.5, pw - 3, TOAST_PX_H - 27, 39, a.glow, 3);
-    drawText(ctx, label, TOAST_PX_W / 2, TOAST_PX_H / 2 + 2, FS.body, COLOR.text, { weight: 700, align: 'center', baseline: 'middle' });
+    const py = TOAST_PX_H - 12 - ph;
+    fillRound(ctx, px, py, pw, ph, lines.length === 1 ? 40 : 46, 'rgba(8,9,20,0.92)');
+    strokeRound(ctx, px + 1.5, py + 1.5, pw - 3, ph - 3, lines.length === 1 ? 39 : 45, a.glow, 3);
+    lines.forEach((ln, i) => {
+      const cy = py + ph / 2 + (i - (lines.length - 1) / 2) * TOAST_LINE_H + 2;
+      drawText(ctx, ln, TOAST_PX_W / 2, cy, FS.body, COLOR.text, { weight: 700, align: 'center', baseline: 'middle' });
+    });
     this.toast.upload();
   }
 

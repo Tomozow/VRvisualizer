@@ -11,7 +11,10 @@ export interface ControllerHandlers {
   squeezeEnd(p: XRPointer): void;
   stick(p: XRPointer, dir: StickDir): void;
   buttonA(p: XRPointer): void;
+  /** B / Y released after a short press */
   buttonB(p: XRPointer): void;
+  /** B / Y is still down after `BUTTON_HOLD_MS` (fires once; the release afterwards is not a tap) */
+  buttonBHold(p: XRPointer): void;
   /** Any physical input happened (fired in addition to the specific callbacks) */
   activity(p: XRPointer): void;
 }
@@ -21,6 +24,9 @@ const BTN_TRIGGER = 0;
 const BTN_SQUEEZE = 1;
 const BTN_A = 4; // A / X
 const BTN_B = 5; // B / Y
+
+/** A press on B / Y at least this long is a hold (recenter) instead of a tap (show / hide menu). */
+const BUTTON_HOLD_MS = 600;
 
 const STICK_ON = 0.65;
 const STICK_OFF = 0.45;
@@ -55,6 +61,8 @@ export class XRPointer {
   squeezeEvent = false;
   prevA = false;
   prevB = false;
+  bDownAt = 0;
+  bHoldFired = false;
   stickDir: StickDir | null = null;
   stickTimer = 0;
   stickRepeating = false;
@@ -417,8 +425,18 @@ export class Controllers {
     const a = buttonValue(gp, BTN_A) > 0.5;
     if (a && !p.prevA) { h.activity(p); h.buttonA(p); }
     p.prevA = a;
+    // B / Y: tap on release, hold (≥ BUTTON_HOLD_MS) while still down
     const b = buttonValue(gp, BTN_B) > 0.5;
-    if (b && !p.prevB) { h.activity(p); h.buttonB(p); }
+    if (b && !p.prevB) {
+      p.bDownAt = performance.now();
+      p.bHoldFired = false;
+      h.activity(p);
+    } else if (b && !p.bHoldFired && performance.now() - p.bDownAt >= BUTTON_HOLD_MS) {
+      p.bHoldFired = true;
+      h.buttonBHold(p);
+    } else if (!b && p.prevB && !p.bHoldFired) {
+      h.buttonB(p);
+    }
     p.prevB = b;
 
     // Thumbstick: dead zone, hysteresis and repeat delay. An active direction is kept until the stick returns

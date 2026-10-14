@@ -3,8 +3,8 @@ import type { Actions, AppState, Store } from '@/app/Store';
 import type { AudioFeatures, PlaybackState } from '@/audio/types';
 import { clamp } from '@/util/device';
 import {
-  COLOR, PANEL_M_H, PANEL_M_W, PANEL_PX_H, PANEL_PX_W, SLIDER, drawText, fillRound, font, hGradient, makeAccent, renderGlass,
-  strokeRound, type Accent,
+  COLOR, PANEL_M_H, PANEL_M_W, PANEL_PX_H, PANEL_PX_W, SLIDER, circle, drawIcon, drawText, fillRound, font, hGradient, makeAccent,
+  renderGlass, strokeRound, type Accent,
 } from './theme';
 import { drawPlayer, drawScenes, drawSettings, drawSources } from './tabs';
 import {
@@ -37,6 +37,9 @@ const LIFT = { live: 0.002, hover: 0.004, beat: 0.006 } as const;
 const GRAB_PITCH_MIN = -0.4;
 const GRAB_PITCH_MAX = 0.5;
 
+/** A slider drag ticks the haptics every time the value crosses a multiple of this fraction of its range. */
+const DRAG_TICK_STEP = 0.05;
+
 interface Slot {
   /** hover widget (used for the highlight overlay) */
   hover: Widget | null;
@@ -45,6 +48,8 @@ interface Slot {
   inside: boolean;
   px: number;
   py: number;
+  /** haptic detent (multiple of DRAG_TICK_STEP) the current drag last ticked at */
+  tick: number;
 }
 
 export interface PanelOptions {
@@ -57,6 +62,10 @@ export interface PanelOptions {
   setAutoHide(v: boolean): void;
   /** called when the mouse starts / stops hovering a clickable widget */
   onCursor(pointer: boolean): void;
+  /** the ✕ in the header or the Settings button asked to hide the menu */
+  onHide(): void;
+  /** haptic tick for a pointer slot: it entered another widget, or a slider drag crossed a detent */
+  onTick(slot: number): void;
 }
 
 const OVERLAY_VERT = /* glsl */ `
@@ -342,6 +351,8 @@ export class Panel {
   private material: THREE.MeshBasicMaterial;
   private plane = new THREE.PlaneGeometry(1, 1);
   private overlays: HoverOverlay[] = [];
+  /** pulsing highlight on the play button while the audio context has not started */
+  private attention: HoverOverlay;
   private liveSliders: LiveSliderQuad[] = [];
   private liveTexts: LiveTextQuad[] = [];
   private beatDot: THREE.Mesh;
@@ -355,6 +366,10 @@ export class Panel {
 
   private slots: Slot[] = [];
   private holds = new Map<string, { v: number; until: number }>();
+  private noSound = false;
+  private soundStuck = false;
+  /** wall-clock time (ms) at which a timed state asked for a redraw */
+  private redrawAt = Infinity;
 
   // visibility
   private shownTarget = true;
@@ -423,11 +438,13 @@ export class Panel {
     scene.add(this.mesh);
 
     for (let i = 0; i < SLOT_COUNT; i++) {
-      this.slots.push({ hover: null, down: null, drag: null, inside: false, px: 0, py: 0 });
+      this.slots.push({ hover: null, down: null, drag: null, inside: false, px: 0, py: 0, tick: 0 });
       const o = new HoverOverlay(this.plane);
       this.overlays.push(o);
       this.mesh.add(o.mesh);
     }
+    this.attention = new HoverOverlay(this.plane);
+    this.mesh.add(this.attention.mesh);
 
     this.beatMat = new THREE.MeshBasicMaterial({
       color: 0xffffff, transparent: true, depthTest: true, depthWrite: false, toneMapped: false, fog: false,
@@ -459,10 +476,14 @@ export class Panel {
       presenting: false,
       autoHide: opts.getAutoHide(),
       setAutoHide: (v) => { opts.setAutoHide(v); this.dirty = true; },
+      hideMenu: () => opts.onHide(),
+      noSound: false,
+      soundStuck: false,
       renderInfo: () => this.renderInfo(),
       hold: (key) => this.getHold(key),
       setHold: (key, v, ms) => { this.holds.set(key, { v, until: ms === Infinity ? Infinity : this.nowMs + ms }); },
       invalidate: () => { this.dirty = true; },
+      invalidateIn: (ms) => { this.redrawAt = Math.min(this.redrawAt, this.nowMs + ms + 30); },
       nowMs: 0,
     };
 
@@ -530,6 +551,20 @@ export class Panel {
     if (v === this.forceHidden) return;
     this.forceHidden = v;
     if (v) this.cancelAll();
+  }
+
+  /** Playing but silent for a while: the Player tab shows an amber pill. */
+  setNoSound(v: boolean): void {
+    if (v === this.noSound) return;
+    this.noSound = v;
+    this.dirty = true;
+  }
+
+  /** Playing but the audio context has not started: the play button shows ▶ and pulses. */
+  setSoundStuck(v: boolean): void {
+    if (v === this.soundStuck) return;
+    this.soundStuck = v;
+    this.dirty = true;
   }
 
   private cancelAll(): void {
@@ -638,16 +673,24 @@ export class Panel {
     const py = (1 - v) * PANEL_PX_H;
     s.inside = u >= 0 && u <= 1 && v >= 0 && v <= 1;
     if (dragging) {
+      const d = s.drag!;
       if (Math.abs(px - s.px) > 0.4 || Math.abs(py - s.py) > 0.4) {
         s.px = px;
         s.py = py;
-        s.drag!.drag!(px, py, 'move');
+        d.drag!(px, py, 'move');
+        const detent = dragDetent(d, px);
+        if (detent !== s.tick) {
+          s.tick = detent;
+          this.opts.onTick(slot);
+        }
       }
-      s.hover = s.drag;
+      s.hover = d;
     } else {
       s.px = px;
       s.py = py;
+      const prev = s.hover;
       s.hover = s.inside ? this.widgets.hit(px, py) : null;
+      if (s.hover && s.hover.key !== prev?.key) this.opts.onTick(slot);
     }
     if (slot === SLOT_MOUSE) this.setCursor(s.hover !== null);
     return s.inside ? t : -1;
@@ -681,6 +724,7 @@ export class Panel {
       s.down = w;
       if (w.drag) {
         s.drag = w;
+        s.tick = dragDetent(w, s.px);
         w.drag(s.px, s.py, 'start');
       } else if (w.click) {
         this.dirty = true;
@@ -721,9 +765,14 @@ export class Panel {
     this.nowMs = nowMs;
     if (!this.mesh.visible) {
       for (const o of this.overlays) o.hide();
+      this.attention.hide();
       return;
     }
     this.syncClock(nowMs);
+    if (nowMs >= this.redrawAt) {
+      this.redrawAt = Infinity;
+      this.dirty = true;
+    }
 
     const sinceDraw = nowMs - this.lastDrawMs;
     let dragging = false;
@@ -747,6 +796,15 @@ export class Panel {
       } else {
         this.overlays[i].hide();
       }
+    }
+
+    // "tap here": the play button pulses until the audio context runs
+    const play = this.soundStuck && this.interactive ? this.widgets.find('toggle') : null;
+    if (play) {
+      const pulse = 0.5 + 0.5 * Math.sin(nowMs * 0.0055);
+      this.attention.show(play, false, this.eased * (0.3 + 0.7 * pulse), this.accentColor);
+    } else {
+      this.attention.hide();
     }
 
     // beat dot
@@ -861,6 +919,8 @@ export class Panel {
     env.time = this.displayTime(nowMs);
     env.presenting = presenting;
     env.autoHide = this.opts.getAutoHide();
+    env.noSound = this.noSound;
+    env.soundStuck = this.soundStuck;
 
     ctx.clearRect(0, 0, PANEL_PX_W, PANEL_PX_H);
     ctx.drawImage(this.glass, 0, 0);
@@ -907,10 +967,24 @@ export class Panel {
     ctx.lineWidth = 3;
     ctx.stroke();
 
-    // tabs
-    const tabW = 300;
+    // hide button at the right end
+    const hideR = 42;
+    const hideCx = 1984 - hideR;
+    const hideCy = 94;
+    circle(ctx, hideCx, hideCy, hideR, 'rgba(255,255,255,0.075)');
+    ctx.beginPath();
+    ctx.arc(hideCx, hideCy, hideR - 1.5, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    drawIcon(ctx, 'close', hideCx, hideCy, 44, COLOR.text);
+    this.widgets.add({ key: 'hide-menu', x: hideCx - hideR, y: hideCy - hideR, w: hideR * 2, h: hideR * 2, r: hideR, click: () => this.opts.onHide() });
+
+    // tabs, right-aligned against the hide button; narrower tabs if the title needs the room
     const gap = 8;
-    const x0 = 1984 - (tabW * TABS.length + gap * (TABS.length - 1));
+    const tabsRight = hideCx - hideR - 24;
+    const tabW = Math.min(272, Math.floor((tabsRight - (this.beatX + 45) - gap * (TABS.length - 1)) / TABS.length));
+    const x0 = tabsRight - (tabW * TABS.length + gap * (TABS.length - 1));
     TABS.forEach((t, i) => {
       const x = x0 + i * (tabW + gap);
       const y = 52;
@@ -932,6 +1006,7 @@ export class Panel {
     this.cancelAll();
     this.mesh.removeFromParent();
     for (const o of this.overlays) o.dispose();
+    this.attention.dispose();
     for (const q of this.liveSliders) { q.mesh.removeFromParent(); q.dispose(); }
     for (const q of this.liveTexts) { q.mesh.removeFromParent(); q.dispose(); }
     this.liveSliders.length = 0;
@@ -944,6 +1019,12 @@ export class Panel {
     this.texture.dispose();
     this.images.dispose();
   }
+}
+
+/** Which multiple of DRAG_TICK_STEP of the widget's slider groove `px` lies at (0 for widgets without a groove). */
+function dragDetent(w: Widget, px: number): number {
+  const t = w.track;
+  return t ? Math.round(clamp((px - t.x) / t.w, 0, 1) / DRAG_TICK_STEP) : 0;
 }
 
 /** True when `next` differs from `prev` in nothing but the playhead position. */

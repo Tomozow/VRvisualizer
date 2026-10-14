@@ -20,6 +20,8 @@ export interface Widget {
   click?: () => void;
   /** px / py are canvas pixel coordinates (they may lie outside the rect while dragging) */
   drag?: (px: number, py: number, phase: DragPhase) => void;
+  /** Slider groove (left edge, length in canvas px): the panel ticks the haptics every 5 % of a drag along it */
+  track?: { x: number; w: number };
 }
 
 export class WidgetList {
@@ -168,11 +170,19 @@ export interface TabEnv {
   presenting: boolean;
   autoHide: boolean;
   setAutoHide(v: boolean): void;
+  /** Hide the menu (header ✕ / Settings); the user gets a toast on how to bring it back */
+  hideMenu(): void;
+  /** Playing, but the input has been silent for a while (see VRUI) */
+  noSound: boolean;
+  /** Playing, but the audio context never started: the play button asks for a tap */
+  soundStuck: boolean;
   renderInfo(): RenderInfo;
   /** While a value is being dragged / just committed the UI shows it instead of the (lagging) store value */
   hold(key: string): number | undefined;
   setHold(key: string, value: number, holdMs: number): void;
   /** Ask for a redraw as soon as the throttle allows */
   invalidate(): void;
+  /** Ask for a redraw once `ms` have passed (a timed state, e.g. an armed confirm button, expires) */
+  invalidateIn(ms: number): void;
   nowMs: number;
 }

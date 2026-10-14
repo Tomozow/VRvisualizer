@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { AudioFeatures, } from '@/audio/types';
 import type { PaletteState, QualityLevel, VizParams } from '@/viz/types';
+import { OUTPUT_GLSL } from '@/viz/shared/Shading';
 
 /**
  * Persistent environment shared by all presets: a distant star field and a subtle floor grid that
@@ -51,13 +52,15 @@ export class Environment {
           gl_Position = projectionMatrix * mv;
         }`,
       fragmentShader: /* glsl */ `
+        precision mediump float;
         uniform vec3 uColor; uniform float uOpacity;
         varying float vA;
+        ${OUTPUT_GLSL}
         void main() {
           vec2 c = gl_PointCoord - 0.5;
           float d = 1.0 - smoothstep(0.0, 0.5, length(c));
           vec3 col = mix(vec3(1.0), uColor, 0.35);
-          gl_FragColor = vec4(col * d * vA, 1.0) * uOpacity;
+          gl_FragColor = vec4(cheapOutputAdditive(col * d * vA * uOpacity), 1.0);
         }`,
       transparent: true,
       depthWrite: false,
@@ -87,6 +90,7 @@ export class Environment {
       fragmentShader: /* glsl */ `
         uniform float uTime, uBeat, uBass, uOpacity; uniform vec3 uColor, uColor2, uColor3;
         varying vec2 vUv; varying vec3 vWorld;
+        ${OUTPUT_GLSL}
         float gauss(float x, float s) { return exp(-x * x / (2.0 * s * s)); }
         void main() {
           vec2 p = vWorld.xz;
@@ -113,7 +117,7 @@ export class Environment {
                    + uColor3 * rings
                    + uColor2 * beatRing
                    + uColor3 * horizon;
-          gl_FragColor = vec4(col, 1.0) * uOpacity;
+          gl_FragColor = vec4(cheapOutputAdditive(col * uOpacity), 1.0);
         }`,
       transparent: true,
       depthWrite: false,

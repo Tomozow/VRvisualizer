@@ -260,17 +260,6 @@ export function wrapText(ctx: CanvasRenderingContext2D, str: string, maxW: numbe
   return lines;
 }
 
-export function formatTime(sec: number): string {
-  if (!Number.isFinite(sec) || sec < 0) return '–:––';
-  const s = Math.floor(sec);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-  const p = ss < 10 ? `0${ss}` : `${ss}`;
-  if (h > 0) return `${h}:${m < 10 ? '0' : ''}${m}:${p}`;
-  return `${m}:${p}`;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Icons (Path2D, 24x24 design grid)
 // ---------------------------------------------------------------------------------------------
@@ -405,10 +394,15 @@ export function drawMeter(ctx: CanvasRenderingContext2D, x: number, y: number, w
   }
 }
 
-/** Small key-cap label (controller legend). Returns its width. */
-export function drawKeycap(ctx: CanvasRenderingContext2D, x: number, cy: number, label: string, a: Accent): number {
+/** Width a key cap with this label will have (the label is measured with the key-cap font). */
+export function keycapWidth(ctx: CanvasRenderingContext2D, label: string, pad = 40): number {
   ctx.font = font(FS.label, 800);
-  const w = Math.ceil(ctx.measureText(label).width) + 40;
+  return Math.ceil(ctx.measureText(label).width) + pad;
+}
+
+/** Small key-cap label (controller legend); `pad` is the total horizontal padding. Returns its width. */
+export function drawKeycap(ctx: CanvasRenderingContext2D, x: number, cy: number, label: string, a: Accent, pad = 40): number {
+  const w = keycapWidth(ctx, label, pad);
   const h = 72;
   fillRound(ctx, x, cy - h / 2, w, h, 18, 'rgba(255,255,255,0.08)');
   strokeRound(ctx, x + 1.5, cy - h / 2 + 1.5, w - 3, h - 3, 17, a.glow, 3);

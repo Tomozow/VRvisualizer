@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { Actions, Store } from '@/app/Store';
 import type { AudioFeatures } from '@/audio/types';
+import { LABELS } from '@/ui/labels';
 import { clamp } from '@/util/device';
 import { Controllers, type ControllerHandlers, type StickDir, type XRPointer } from './Controllers';
 import { MiniHud } from './MiniHud';
@@ -17,7 +18,23 @@ export interface VRUIOptions {
 
 const AUTOHIDE_SECONDS = 12;
 const AUTOHIDE_STORAGE_KEY = 'resonance-vr.vrui.autohide';
+/** The menu never hides on its own before this long into a session, nor before the user has used it once. */
+const AUTOHIDE_MIN_SESSION_SECONDS = 30;
+/** The "how to get it back" toast accompanies the first few auto-hides only (counted across sessions). */
+const HIDE_HINT_STORAGE_KEY = 'resonance-vr.vrui.hidehints';
+const HIDE_HINT_MAX = 3;
+const HIDE_HINT_PINCH = 'Menu hidden. Pinch to bring it back';
 const VOLUME_STEP = 0.05;
+/** Status checks (silence, suspended audio) run at this rate at most. */
+const STATUS_INTERVAL_SECONDS = 0.25;
+/** Playing but silent for this long: tell the user (the engine's own silence flag already needs > 1 s). */
+const NO_SOUND_SECONDS = 3;
+/** This long after a session starts, "playing" without a running analyser means the audio context is still suspended. */
+const SOUND_CHECK_DELAY_SECONDS = 1.5;
+const SOUND_PROMPT = 'Tap ▶ to start sound';
+const HAPTIC_TICK = { strength: 0.08, ms: 10 } as const;
+/** Hover ticks closer together than this are dropped (a ray sweeping over a row of buttons). */
+const HAPTIC_TICK_MIN_MS = 35;
 /** Re-place the menu in front of the user when it is re-shown while this far (cos of the angle) off-axis... */
 const RESHOW_MIN_COS = Math.cos(THREE.MathUtils.degToRad(75));
 /** ...or this far (m) from the head, e.g. after walking away from where it was left. */
@@ -35,6 +52,7 @@ export class VRUI {
   private camera: THREE.PerspectiveCamera;
   private store: Store;
   private actions: Actions;
+  private features: AudioFeatures;
   private controllers: Controllers;
   private panel: Panel;
   private hud: MiniHud;
@@ -45,6 +63,24 @@ export class VRUI {
   private clock = 0;
   private lastInteraction = 0;
   private autoHide = true;
+  /** clock time the current XR session started, and whether the user has used the menu in it */
+  private sessionStart = 0;
+  private interacted = false;
+  private hideHints = 0;
+  // status polling (≤ 4 Hz): silence, and audio that never started after entering VR
+  private statusTimer = 0;
+  private silentSince = -1;
+  private noSound = false;
+  private soundCheckAt = -1;
+  private soundPrompt = false;
+  private lastTickAt = [0, 0];
+  /** the XR reference space whose `reset` (the user re-centred the headset) moves the menu back in front of them */
+  private refSpace: XRReferenceSpace | null = null;
+  private onSpaceReset = (): void => {
+    // the next frame's pose lives in the new origin: place the panel then (an XRFrame is only valid inside the frame loop)
+    this.headValid = false;
+    this.recenterPending = true;
+  };
   private visible = true;
   /** recentre on the first frame that has a head pose of the current session */
   private recenterPending = false;
@@ -71,12 +107,14 @@ export class VRUI {
     this.camera = opts.camera;
     this.store = opts.store;
     this.actions = opts.actions;
+    this.features = opts.features;
     const params = new URLSearchParams(location.search);
     this.debugHud = params.has('vrhud');
     try {
       this.autoHide = localStorage.getItem(AUTOHIDE_STORAGE_KEY) !== '0';
+      this.hideHints = Number.parseInt(localStorage.getItem(HIDE_HINT_STORAGE_KEY) ?? '0', 10) || 0;
     } catch {
-      /* storage unavailable: keep the default */
+      /* storage unavailable: keep the defaults */
     }
 
     this.panel = new Panel({
@@ -88,6 +126,8 @@ export class VRUI {
       getAutoHide: () => this.autoHide,
       setAutoHide: (v) => this.setAutoHide(v),
       onCursor: (pointer) => { opts.renderer.domElement.style.cursor = pointer ? 'pointer' : ''; },
+      onHide: () => this.hideMenu(),
+      onTick: (slot) => this.tick(slot),
     });
     this.hud = new MiniHud(opts.scene, opts.store, opts.features);
 
@@ -97,9 +137,21 @@ export class VRUI {
       squeezeStart: (p) => this.onSqueezeStart(p),
       squeezeEnd: (p) => this.panel.endGrab(p.slot),
       stick: (p, dir) => this.onStick(p, dir),
-      buttonA: (p) => { this.reveal(); this.actions.toggle(); p.pulse(0.3, 30); },
-      buttonB: (p) => { this.actions.toggleMenu(); p.pulse(0.3, 30); },
-      activity: () => this.touch(),
+      // Shortcuts act without opening the menu; their feedback is a toast. Only B / Y, trigger and grip reveal it.
+      buttonA: (p) => {
+        const willPlay = !this.store.state.playback.playing;
+        this.actions.toggle();
+        this.actions.toast(willPlay ? 'Playing' : 'Paused', 1200);
+        p.pulse(0.3, 30);
+      },
+      buttonB: (p) => {
+        const hiding = this.store.state.menuVisible;
+        this.actions.toggleMenu();
+        if (hiding) this.actions.toast('Menu hidden', 1400);
+        p.pulse(0.3, 30);
+      },
+      buttonBHold: (p) => this.bringMenuHere(p),
+      activity: () => this.touchIfVisible(),
     };
     this.controllers = new Controllers(opts.renderer, opts.scene, handlers);
 
@@ -124,13 +176,22 @@ export class VRUI {
       this.headValid = false;
       this.recenterPending = true;
       this.settleTimer = SETTLE_SECONDS;
+      this.sessionStart = this.clock;
+      this.interacted = false;
+      this.soundCheckAt = this.clock + SOUND_CHECK_DELAY_SECONDS;
       this.touch();
+      this.unwatchReferenceSpace();
+      this.refSpace = xr.getReferenceSpace();
+      this.refSpace?.addEventListener('reset', this.onSpaceReset);
     };
     const onEnd = (): void => {
       // App resets the desktop camera right after this event; recentre in front of it on the next frame.
       this.headValid = false;
       this.recenterPending = true;
       this.settleTimer = -1;
+      this.soundCheckAt = -1;
+      this.setSoundPrompt(false);
+      this.unwatchReferenceSpace();
     };
     xr.addEventListener('sessionstart', onStart);
     xr.addEventListener('sessionend', onEnd);
@@ -180,13 +241,22 @@ export class VRUI {
     }
     this.feedMouse(xr);
 
-    // 4. auto-hide
-    if (this.panel.hovered || this.panel.busy) this.touch();
+    // 4. status checks (≤ 4 Hz), then auto-hide: only for someone who has used the menu, and never in a session's first 30 s
+    this.statusTimer += dt;
+    if (this.statusTimer >= STATUS_INTERVAL_SECONDS) {
+      this.statusTimer = 0;
+      this.pollStatus();
+    }
+    if (this.panel.hovered || this.panel.busy) {
+      this.touch();
+      this.interacted = true;
+    }
     if (
-      xr && this.autoHide && state.menuVisible && state.playback.playing && !this.panel.busy &&
-      this.clock - this.lastInteraction > AUTOHIDE_SECONDS
+      xr && this.autoHide && this.interacted && state.menuVisible && state.playback.playing && !this.panel.busy &&
+      this.clock - this.sessionStart >= AUTOHIDE_MIN_SESSION_SECONDS && this.clock - this.lastInteraction > AUTOHIDE_SECONDS
     ) {
       this.actions.setMenuVisible(false);
+      this.hintHidden();
     }
 
     // 5. draw
@@ -197,6 +267,8 @@ export class VRUI {
       forward: this.headForward,
       menuVisible: this.panel.isShown && this.panel.opacity > 0.05,
       enabled: this.visible && (xr || this.debugHud),
+      noSound: this.noSound,
+      handsOnly: this.handsOnly(),
       accent: this.panel.accent,
       accentColor: this.panel.accentColor,
     });
@@ -224,6 +296,7 @@ export class VRUI {
     for (const fn of this.cleanup) fn();
     this.cleanup.length = 0;
     this.renderer.domElement.style.cursor = '';
+    this.unwatchReferenceSpace();
     this.controllers.dispose();
     this.panel.dispose();
     this.hud.dispose();
@@ -235,6 +308,11 @@ export class VRUI {
 
   private touch(): void {
     this.lastInteraction = this.clock;
+  }
+
+  /** Input that does not open the menu keeps it alive while it is open, and is otherwise ignored. */
+  private touchIfVisible(): void {
+    if (this.store.state.menuVisible) this.touch();
   }
 
   private reveal(): void {
@@ -260,6 +338,7 @@ export class VRUI {
   }
 
   private onSelectStart(p: XRPointer): void {
+    this.interacted = true;
     if (!this.panel.interactive) {
       this.reveal();
       return;
@@ -278,7 +357,6 @@ export class VRUI {
   }
 
   private onStick(p: XRPointer, dir: StickDir): void {
-    this.reveal();
     const s = this.store.state;
     switch (dir) {
       case 'left':
@@ -294,11 +372,103 @@ export class VRUI {
       case 'down': {
         const v = clamp(Math.round((s.playback.volume + (dir === 'up' ? VOLUME_STEP : -VOLUME_STEP)) * 100) / 100, 0, 1);
         this.actions.setVolume(v);
-        this.actions.toast(`Volume ${Math.round(v * 100)}%`, 900);
+        this.actions.toast(`Volume ${Math.round(v * 100)} %`, 900);
         p.pulse(0.12, 15);
         break;
       }
     }
+  }
+
+  /** Hide from the header ✕ / Settings: the toast says how to bring it back (hands have no B / Y). */
+  private hideMenu(): void {
+    this.actions.setMenuVisible(false);
+    if (this.handsOnly()) this.actions.toast(HIDE_HINT_PINCH, 4500);
+    else this.actions.toast('Menu hidden', 1600);
+  }
+
+  /** After an auto-hide: for the first few times, explain how to get the menu back. */
+  private hintHidden(): void {
+    if (this.hideHints >= HIDE_HINT_MAX) return;
+    this.hideHints++;
+    try {
+      localStorage.setItem(HIDE_HINT_STORAGE_KEY, String(this.hideHints));
+    } catch {
+      /* the in-memory count still limits this session */
+    }
+    this.actions.toast(this.handsOnly() ? HIDE_HINT_PINCH : LABELS.menuHiddenHint, 5000);
+  }
+
+  /** Long press on B / Y: show the menu if needed and put it in front of the user. */
+  private bringMenuHere(p: XRPointer): void {
+    if (!this.store.state.menuVisible) this.actions.setMenuVisible(true);
+    this.recenter();
+    this.actions.toast('Menu recentered', 1400);
+    p.pulse(0.5, 60);
+  }
+
+  /** True while the only tracked input is hands (no controller with B / Y or a trigger). */
+  private handsOnly(): boolean {
+    let hands = false;
+    for (const p of this.controllers.pointers) {
+      if (!p.connected) continue;
+      if (!p.isHand) return false;
+      hands = true;
+    }
+    return hands;
+  }
+
+  /** Haptic detent for a pointer slot (the mouse, slot 2, has none; hands have no actuator). */
+  private tick(slot: number): void {
+    const p = this.controllers.pointers[slot];
+    if (!p) return;
+    const now = performance.now();
+    if (now - this.lastTickAt[slot] < HAPTIC_TICK_MIN_MS) return;
+    this.lastTickAt[slot] = now;
+    p.pulse(HAPTIC_TICK.strength, HAPTIC_TICK.ms);
+  }
+
+  /** Silence and suspended-audio checks; runs at most every STATUS_INTERVAL_SECONDS. */
+  private pollStatus(): void {
+    const pb = this.store.state.playback;
+    const f = this.features;
+
+    // "No sound heard": playing through a running analyser that has been silent for a while
+    if (pb.playing && f.active && f.silence) {
+      if (this.silentSince < 0) this.silentSince = this.clock;
+    } else {
+      this.silentSince = -1;
+    }
+    const noSound = this.silentSince >= 0 && this.clock - this.silentSince > NO_SOUND_SECONDS;
+    if (noSound !== this.noSound) {
+      this.noSound = noSound;
+      this.panel.setNoSound(noSound);
+    }
+
+    // Entering VR can leave the audio context suspended ("playing" but nothing analysed): ask for a tap on ▶
+    if (this.soundCheckAt >= 0 && this.clock >= this.soundCheckAt) {
+      this.soundCheckAt = -1;
+      if (pb.playing && !f.active) {
+        this.setSoundPrompt(true);
+        this.actions.toast(SOUND_PROMPT, 6000);
+        const s = this.store.state;
+        if (!s.menuVisible) {
+          this.actions.setMenuVisible(true);
+          this.touch(); // the store listener that normally does this runs after the auto-hide check of this frame
+        }
+        if (s.tab !== 'player') this.actions.setTab('player');
+      }
+    }
+    if (this.soundPrompt && (f.active || !pb.playing)) this.setSoundPrompt(false);
+  }
+
+  private setSoundPrompt(v: boolean): void {
+    this.soundPrompt = v;
+    this.panel.setSoundStuck(v);
+  }
+
+  private unwatchReferenceSpace(): void {
+    this.refSpace?.removeEventListener('reset', this.onSpaceReset);
+    this.refSpace = null;
   }
 
   /**
