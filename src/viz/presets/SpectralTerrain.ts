@@ -7,6 +7,8 @@ const WIDTH = 60;
 const DEPTH = 45;
 const Z_CENTER = -4; // plane spans z = -26.5 .. +18.5: deeper ahead, still covered behind
 const CEILING_Y = 9;
+const FLOOR_LIFT = 0.03; // keeps the flat zone above the shared environment floor (y = 0) so it is not z-fought / lit through
+const HORIZON_HEIGHT = 16;
 const BEAT_RING_MAX = 40; // metres
 const BEAT_RING_SPEED = 15; // metres per second
 
@@ -67,7 +69,8 @@ float terrainH(vec2 xz) {
   float mask = edgeMask(xz);
   float h = pow(e, 1.5) * 4.0 * uIntensity * front * dip * mask;
   // swell travelling across the ground on every beat
-  float swell = exp(-pow((r - uBeatRing) / 1.4, 2.0)) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0));
+  float sw = (r - uBeatRing) / 1.4;
+  float swell = exp(-sw * sw) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0));
   return h + swell * uBeatAmp * 0.7 * smoothstep(1.0, 3.0, r) * mask;
 }
 
@@ -80,7 +83,7 @@ void main() {
   vec3 n = normalize(vec3(-(hx - h0) / EPS, 1.0, -(hz - h0) / EPS));
 
   float sgn = 1.0 - 2.0 * aCeil;
-  vec3 p = vec3(xz.x * sgn, mix(h0, CEILING_Y - h0, aCeil), xz.y);
+  vec3 p = vec3(xz.x * sgn, mix(h0 + position.y, CEILING_Y - h0 - position.y, aCeil), xz.y);
   vNormal = mat3(modelMatrix) * vec3(n.x * sgn, n.y * sgn, n.z);
   vec4 wp = modelMatrix * vec4(p, 1.0);
   vWorld = wp.xyz;
@@ -129,7 +132,7 @@ void main() {
   vec2 gd = abs(fract(gp - 0.5) - 0.5) / max(gw, vec2(1e-4));
   vec2 gl = (1.0 - smoothstep(0.5, 1.5, gd)) * (1.0 - smoothstep(0.22, 0.55, gw));
   float lines = max(gl.x * 0.7, gl.y);
-  vec3 lineCol = texture2D(uGradient, vec2(clamp(g + 0.3, 0.0, 1.0), 0.5)).rgb;
+  vec3 lineCol = texture2D(uGradient, vec2(clamp(0.38 + vH * 0.2, 0.0, 1.0), 0.5)).rgb;
   col += lineCol * lines * (0.9 + 1.4 * smoothstep(0.1, 2.5, vH));
 
   // Topographic contour lines every 0.4 m of height.
@@ -140,7 +143,8 @@ void main() {
 
   // Beat ring racing across the ground from the user's position.
   float r = length(vWorld.xz);
-  float ringI = exp(-pow((r - uBeatRing) / 0.5, 2.0)) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0));
+  float rd = (r - uBeatRing) / 0.5;
+  float ringI = exp(-rd * rd) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0));
   col += mix(uAccent, vec3(1.0), 0.35) * ringI * (0.35 + 1.8 * lines + 0.6 * contour);
 
   col *= exp(-pow(dist * 0.038, 2.0)) * mix(1.0, 0.5, vCeil) * uBrightness * (0.85 + 0.3 * uLevel) * (1.0 + uBeat * 0.2);
@@ -171,7 +175,7 @@ uniform float uBrightness;
 varying float vEnergy;
 varying float vY;
 void main() {
-  float rim = exp(-vY * 0.45) + exp(-(${CEILING_Y.toFixed(1)} - vY) * 0.45);
+  float rim = exp(-vY * 0.7) + exp(-abs(vY - ${CEILING_Y.toFixed(1)}) * 0.7);
   vec3 col = texture2D(uGradient, vec2(0.4 + 0.45 * vEnergy, 0.5)).rgb * rim * (0.05 + 0.5 * vEnergy);
   gl_FragColor = vec4(col * uBrightness * uOpacity, 1.0);
   #include <tonemapping_fragment>
@@ -212,7 +216,7 @@ export class SpectralTerrain implements Preset {
 
     const geo = new THREE.PlaneGeometry(WIDTH, DEPTH, sx, sz);
     geo.rotateX(-Math.PI / 2);
-    geo.translate(0, 0, Z_CENTER);
+    geo.translate(0, FLOOR_LIFT, Z_CENTER);
     geo.deleteAttribute('normal');
     geo.deleteAttribute('uv');
     geo.setAttribute('aCeil', new THREE.InstancedBufferAttribute(new Float32Array([0, 1]), 1));
@@ -226,8 +230,8 @@ export class SpectralTerrain implements Preset {
     const terrain = new THREE.InstancedMesh(geo, mat, 2);
     terrain.frustumCulled = false; // displaced in the vertex shader
 
-    const horizonGeo = new THREE.CylinderGeometry(40, 40, CEILING_Y, 128, 1, true);
-    horizonGeo.translate(0, CEILING_Y / 2, 0);
+    const horizonGeo = new THREE.CylinderGeometry(40, 40, HORIZON_HEIGHT, 128, 1, true);
+    horizonGeo.translate(0, HORIZON_HEIGHT / 2, 0);
     const horizonMat = new THREE.ShaderMaterial({
       uniforms: this.uniforms,
       vertexShader: HORIZON_VERTEX,

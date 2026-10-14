@@ -39,6 +39,7 @@ const FLUX_MIN = 0.22;
 const FLUX_FALLBACK_AFTER = 1.5; // s without a bass event before the flux detector may fire
 const GRID_TOL = 0.2;           // events within ±20 % of a period of the beat grid count as on-grid
 const OFF_GRID_ACCEPT = 0.7;    // off-grid events still count as beats when this strong relative to on-grid ones
+const OFF_STREAK_RESET = 6;     // this many off-grid events in a row invalidate the tempo
 const HALF_BEAT_ACCEPT = 1.2;   // ... and this strong when they sit on the off-beat (bass lines live there)
 const REFRACTORY_MIN = 0.12;
 const REFRACTORY_MAX = 0.3;
@@ -97,10 +98,7 @@ export class FeatureExtractor {
   private curE = 0;
   private curT = 0;
   private onAvg = 0;
-  private offAvg = 0;
-  private offC = 0;
-  private offS = 0;
-  private offN = 0;
+  private offStreak = 0;
   private lastReg = -10;
 
   constructor(private f: AudioFeatures) {
@@ -325,10 +323,10 @@ export class FeatureExtractor {
     if (isBass) { this.curOn = on; this.curE = e; this.curT = t; }
     if (!ready) return;
     if (t - this.lastReg >= REFRACTORY_MIN) { this.lastReg = t; this.registerBeat(t); } // tempo learning sees every event
-    if (on) this.fire(t, rel, e);
+    if (on) this.fire(t, rel);
   }
 
-  private fire(t: number, rel: number, e: number): void {
+  private fire(t: number, rel: number): void {
     const f = this.f;
     const period = f.bpm > 0 ? 60 / f.bpm : 0;
     const refractory = period > 0 ? Math.min(REFRACTORY_MAX, Math.max(REFRACTORY_MIN, period * 0.35)) : REFRACTORY_MIN;
@@ -338,10 +336,9 @@ export class FeatureExtractor {
     f.beatStrength = Math.min(1, 0.35 + 0.65 * rel);
     f.beatCount++;
     this.lastBeat = t;
-    if (period > 0) this.anchor += 0.25 * e * period; // phase-locked loop
   }
 
-  /** The rise event that started at `curT` is over: learn from its peak */
+  /** The rise event that started at `curT` is over: learn from its peak and keep the grid on the strongest phase */
   private endEvent(peak: number): void {
     const f = this.f;
     const i = this.evN % BEAT_HISTORY;
@@ -351,44 +348,47 @@ export class FeatureExtractor {
     if (this.lastBeat === this.curT) f.beatStrength = Math.min(1, 0.3 + 0.7 * rel);
     if (f.bpm <= 0) return;
 
-    const period = 60 / f.bpm;
     if (this.curOn) {
       this.onAvg += (peak - this.onAvg) * 0.25;
-      this.offAvg *= 0.9;
+      this.offStreak = 0;
+    } else if (++this.offStreak >= OFF_STREAK_RESET) {
+      this.resetTempo(); // the music does not fit the grid (wrong tempo, or the tempo changed)
       return;
+    } else {
+      // off-grid event: a beat anyway if it is as strong as the on-grid ones (syncopated kick), reported a few frames late
+      const need = Math.abs(this.curE) > 0.4 ? HALF_BEAT_ACCEPT : OFF_GRID_ACCEPT;
+      if (peak >= need * this.onAvg && this.warm > WARMUP) this.fire(this.curT, rel);
     }
-    // off-grid event: a beat anyway if it is as strong as the on-grid ones (syncopated kick), reported a few frames late
-    const need = Math.abs(this.curE) > 0.4 ? HALF_BEAT_ACCEPT : OFF_GRID_ACCEPT;
-    if (peak >= need * this.onAvg && this.warm > WARMUP) this.fire(this.curT, rel, 0);
-    this.offAvg += (peak - this.offAvg) * 0.25;
-    const a = TWO_PI * this.curE;
-    this.offC += (Math.cos(a) - this.offC) * 0.3;
-    this.offS += (Math.sin(a) - this.offS) * 0.3;
-    this.offN++;
-    // off-grid events that are consistently stronger and at a consistent phase: slide the grid onto them
-    if (this.offN >= 4 && this.offAvg > 1.3 * this.onAvg && Math.hypot(this.offC, this.offS) > 0.7) {
-      this.anchor += Math.atan2(this.offS, this.offC) / TWO_PI * period;
-      this.onAvg = this.offAvg;
-      this.offAvg = 0;
-      this.offN = 0;
-    }
+    this.alignGrid(0.35);
   }
 
-  /** Put the grid on the phase that carries the most event energy (kicks beat off-beat bass notes) */
-  private alignAnchor(t: number): void {
+  /**
+   * Move the beat grid towards the phase that carries the most recent event energy (peak², newest first): kicks win
+   * over off-beat bass notes, and a phase jump of up to half a beat is followed within a few events.
+   */
+  private alignGrid(gain: number): void {
     const period = 60 / this.f.bpm;
-    let sx = 0, sy = 0;
-    for (let i = 0; i < Math.min(this.evN, BEAT_HISTORY); i++) {
-      if (t - this.evT[i] > 12) continue;
-      const w = this.evP[i] * this.evP[i];
-      const a = TWO_PI * this.evT[i] / period;
+    const n = Math.min(this.evN, BEAT_HISTORY);
+    let sx = 0, sy = 0, age = 1;
+    for (let k = 1; k <= n; k++, age *= 0.9) {
+      const j = (this.evN - k) % BEAT_HISTORY;
+      const w = age * this.evP[j] * this.evP[j];
+      const a = TWO_PI * this.evT[j] / period;
       sx += w * Math.cos(a); sy += w * Math.sin(a);
     }
-    if (sx === 0 && sy === 0) { this.anchor = t; return; }
-    const ph = Math.atan2(sy, sx) / TWO_PI;
-    this.anchor = (ph + Math.floor(t / period)) * period;
+    if (sx === 0 && sy === 0) return;
+    const target = Math.atan2(sy, sx) / TWO_PI;
+    const cur = this.anchor / period;
+    let d = target - (cur - Math.floor(cur));
+    d -= Math.round(d);
+    this.anchor += gain * d * period;
+  }
+
+  private lockGrid(t: number): void {
+    this.anchor = t;
+    this.alignGrid(1);
     this.onAvg = this.riseRef * 0.8;
-    this.offAvg = 0; this.offN = 0;
+    this.offStreak = 0;
   }
 
   /** Inter-beat-interval histogram (folded into 60–180 BPM) + least-squares refinement and hysteresis */
@@ -428,12 +428,12 @@ export class FeatureExtractor {
     const cand = this.refine(BPM_MIN + num / den);
 
     const f = this.f;
-    if (f.bpm === 0) { f.bpm = cand; this.pending = 0; this.alignAnchor(t); return; }
+    if (f.bpm === 0) { f.bpm = cand; this.pending = 0; this.lockGrid(t); return; }
     if (Math.abs(cand - f.bpm) < f.bpm * 0.025) { f.bpm += 0.25 * (cand - f.bpm); this.pending = 0; return; }
     // a different tempo must win several times in a row before the grid moves
     if (this.pending > 0 && Math.abs(cand - this.pendingBpm) < this.pendingBpm * 0.03) this.pending++;
     else { this.pending = 1; this.pendingBpm = cand; }
-    if (this.pending >= 4) { f.bpm = cand; this.pending = 0; this.alignAnchor(t); }
+    if (this.pending >= 4) { f.bpm = cand; this.pending = 0; this.lockGrid(t); }
   }
 
   /** Least-squares fit of beat times on the nominal grid; returns the refined BPM (or the input if the grid is ragged) */

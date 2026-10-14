@@ -502,6 +502,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
 
   /** Fatal problem with the current source: show it and skip ahead when there is somewhere to go */
   private onSourceError(message: string): void {
+    if (this.pb.status === 'error' && this.pb.message === message) return; // play() rejection + media 'error' event
     this.set({ playing: false });
     this.report(message, 'error');
     const token = this.token;

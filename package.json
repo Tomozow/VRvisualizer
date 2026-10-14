@@ -10,6 +10,7 @@
     "preview": "vite preview --host",
     "typecheck": "tsc --noEmit",
     "screens": "node tests/screenshots.mjs",
+    "test": "bash tests/run.sh",
     "check": "npm run typecheck && npm run build"
   },
   "dependencies": {

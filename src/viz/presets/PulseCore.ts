@@ -265,7 +265,8 @@ void main() {
   float t = (1.0 - vRho) / 0.5;      // 0 at the leading edge .. 1 at the inner edge
   float d = (1.0 - vRho) * vScale;   // metres behind the leading edge
   float trail = smoothstep(0.0, 0.05, d) * exp(-d * 3.2) * (1.0 - t);
-  float edge = exp(-pow((d - 0.07) / 0.045, 2.0));
+  float ed = (d - 0.07) / 0.045;
+  float edge = exp(-ed * ed);
   float life = pow(clamp(1.0 - vAge, 0.0, 1.0), 1.6);
   vec3 tint = texture2D(uGradient, vec2(0.65 + 0.25 * (1.0 - vAge), 0.5)).rgb;
   vec3 col = tint * trail * 1.3 + mix(uAccent, vec3(1.0), 0.5) * edge * 1.6;

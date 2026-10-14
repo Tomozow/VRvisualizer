@@ -144,8 +144,9 @@ void main() {
   // Beat wave climbing the pillars, delayed on the outer rings.
   float ph = uBeatWave - vRing * 0.07;
   float wy = ph * ${WAVE_HEIGHT.toFixed(1)};
-  float wave = exp(-pow((y - wy) / 0.3, 2.0)) * (1.0 - smoothstep(0.45, 1.1, ph)) * step(0.0, ph) / (1.0 + vRing * 0.8);
-  col += mix(uAccent, vec3(1.0), 0.15) * wave * 0.9;
+  float wd = (y - wy) / 0.3;
+  float wave = exp(-wd * wd) * (1.0 - smoothstep(0.45, 1.1, ph)) * step(0.0, ph) / (1.0 + vRing * 0.8);
+  col += mix(texture2D(uGradient, vec2(0.8, 0.5)).rgb, uAccent, 0.25) * wave * 0.9;
 
   // Rings further out are dimmer and dissolve into the dark with distance.
   float fade = exp(-pow(dist * 0.045, 2.0)) / (1.0 + 0.4 * vRing);
@@ -184,7 +185,7 @@ void main() {
   float amt = fx * ndv * pow(vLocalY, 2.2) * smoothstep(0.12, 0.85, vEnergy);
 
   float g = clamp(y * 0.115 + vEnergy * 0.28 + 0.1, 0.0, 1.0);
-  vec3 col = texture2D(uGradient, vec2(g, 0.5)).rgb * amt * 9.0 * uBrightness * (1.0 + uBeat * 0.35);
+  vec3 col = texture2D(uGradient, vec2(g, 0.5)).rgb * amt * 1.4 * uBrightness * (1.0 + uBeat * 0.35);
   col *= mix(1.0, 0.3 * exp(-y * 0.5), vMirror) * uOpacity;
   gl_FragColor = vec4(col, 1.0);
   #include <tonemapping_fragment>

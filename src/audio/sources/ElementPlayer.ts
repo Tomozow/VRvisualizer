@@ -74,6 +74,7 @@ export class ElementPlayer {
       const name = (e as DOMException).name;
       if (name === 'AbortError') return; // superseded by a newer load()
       if (name === 'NotAllowedError') throw new Error('The browser blocked autoplay. Press play to start.');
+      if (name === 'NotSupportedError') throw new Error(this.describeError());
       throw e;
     }
   }

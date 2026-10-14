@@ -12,4 +12,5 @@ for i in $(seq 1 40); do curl -sf http://localhost:4173/ >/dev/null && break; sl
 status=0
 node tests/screenshots.mjs "$@" || status=$?
 node tests/xr.mjs "$@" || status=$?
+node tests/audio.mjs "$@" || status=$?
 exit $status
