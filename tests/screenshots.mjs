@@ -80,8 +80,8 @@ for (const tab of ['scenes', 'sources', 'settings']) {
   await page.waitForTimeout(600);
   await page.screenshot({ path: `${outDir}/91-menu-${tab}.png` });
 }
-await page.evaluate(() => { window.app.overlay.setHidden(false); });
-await page.waitForTimeout(400);
+await page.evaluate(() => { window.app.setMenuVisible(false); window.app.overlay.setHidden(false); });
+await page.waitForTimeout(1500);
 await page.screenshot({ path: `${outDir}/95-overlay.png` });
 
 const unique = [...new Set(errors)];
