@@ -1,3 +1,4 @@
+import type { AudioFeatures } from '@/audio/types';
 import type { Actions, AppState, Store } from '@/app/Store';
 import type { PlaybackState, SourceKind, Track } from '@/audio/types';
 import type { Palette } from '@/viz/types';
@@ -123,7 +124,13 @@ export class DomOverlay {
   private holdSeekUntil = 0;
   private welcomed = false;
 
-  constructor(private readonly root: HTMLElement, private readonly store: Store, private readonly actions: Actions) {
+  constructor(
+    private readonly root: HTMLElement,
+    private readonly store: Store,
+    private readonly actions: Actions,
+    /** Live audio features (same object as engine.features) for level / silence indicators */
+    private readonly features?: AudioFeatures,
+  ) {
     root.classList.add('dom-ui');
     root.innerHTML = buildTemplate();
     this.el = collect(root);

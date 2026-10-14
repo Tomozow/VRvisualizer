@@ -26,8 +26,10 @@ const BAND_RELEASE = 0.35;      // s
 
 // ---- loudness / silence -----------------------------------------------------------------------------------------
 const LEVEL_FLOOR = 0.012;      // RMS reference floor (≈ -38 dBFS)
-const SILENCE_RMS = 0.0015;     // ≈ -56 dBFS
+const SILENCE_RMS = 0.004;      // ≈ -48 dBFS: above a headset mic's noise floor (white noise at this level stays "silent")
+const SILENCE_WAKE = 1.5;       // silence ends once rms exceeds SILENCE_RMS × this (between the two the state is held)
 const SILENCE_HOLD = 1.0;       // s
+const BAND_RELEASE_SILENT = 0.1; // s: bands fall to zero quickly once the input is declared silent
 const ENERGY_TAU = 2;           // s
 
 // ---- beat detection ---------------------------------------------------------------------------------------------
@@ -49,6 +51,9 @@ const BEAT_ENV_TAU = 0.12;      // s; 350 ms → ≈5 %
 const WARMUP = 0.6;             // s of data before beats can fire
 const BPM_MIN = 60;
 const BPM_MAX = 180;
+const FOLD_EPS = 0.01;          // s: slack on the interval folding so tempi at the range edges (60, 180) do not flip octaves
+const OCTAVE_MARGIN = 1.4;      // an octave-related tempo must out-weigh the current one by this factor ...
+const OCTAVE_HOLD = 2;          // ... for this many seconds before the tempo jumps
 const HIST_BINS = BPM_MAX - BPM_MIN + 1;
 const BEAT_HISTORY = 16;
 const TWO_PI = Math.PI * 2;
@@ -91,6 +96,7 @@ export class FeatureExtractor {
   private beatN = 0;
   private pending = 0;
   private pendingBpm = 0;
+  private octaveSince = -1;                          // clock time since which an octave-related tempo has been winning
   // beat grid (phase-locked once a tempo is known)
   private anchor = 0;
   private evT = new Float64Array(BEAT_HISTORY);      // recent bass events (accepted or not): time + peak
@@ -157,6 +163,7 @@ export class FeatureExtractor {
     this.hist.fill(0);
     this.beatN = 0;
     this.pending = 0;
+    this.octaveSince = -1;
     this.f.bpm = 0;
   }
 
@@ -178,21 +185,8 @@ export class FeatureExtractor {
     const rms = Math.sqrt(sumSq / wave.length);
     f.peak = peak;
 
-    if (rms < SILENCE_RMS) this.silentFor += dt;
-    else if (rms > SILENCE_RMS * 2) this.silentFor = 0;
-    const silent = this.silentFor > SILENCE_HOLD;
-    f.silence = silent;
-
-    // level (AGC): fast attack reference, slow release, floored
-    if (rms > this.levelRef) this.levelRef += (rms - this.levelRef) * (1 - Math.exp(-dt / 0.1));
-    else this.levelRef = Math.max(LEVEL_FLOOR, this.levelRef * Math.exp(-dt / (silent ? AGC_RELEASE_SILENT : AGC_RELEASE)));
-    const lv = silent ? 0 : Math.min(1, rms / this.levelRef);
-    f.level += (lv - f.level) * (1 - Math.exp(-dt / (lv > f.level ? 0.04 : 0.15)));
-    f.energy += (f.level - f.energy) * (1 - Math.exp(-dt / ENERGY_TAU));
-
-    this.updateWaveform(peak, dt);
-
-    // ---- bands ---------------------------------------------------------------------------------------------------
+    // ---- bands (noise gated) -------------------------------------------------------------------------------------
+    // computed before the silence decision: a spectrum that is entirely below the noise gate counts as silence
     const freq = f.freq, raw = f.bandsRaw, bands = f.bands;
     const inv = 1 / 255;
     let frameMax = 0;
@@ -211,12 +205,28 @@ export class FeatureExtractor {
       raw[b] = x;
       if (x > frameMax) frameMax = x;
     }
+
+    // ---- silence ---------------------------------------------------------------------------------------------------
+    if (frameMax === 0 || rms < SILENCE_RMS) this.silentFor += dt;
+    else if (rms > SILENCE_RMS * SILENCE_WAKE) this.silentFor = 0;
+    const silent = this.silentFor > SILENCE_HOLD;
+    f.silence = silent;
+
+    // level (AGC): fast attack reference, slow release, floored; gated to 0 while the input is silent
+    if (rms > this.levelRef) this.levelRef += (rms - this.levelRef) * (1 - Math.exp(-dt / 0.1));
+    else this.levelRef = Math.max(LEVEL_FLOOR, this.levelRef * Math.exp(-dt / (silent ? AGC_RELEASE_SILENT : AGC_RELEASE)));
+    const lv = silent ? 0 : Math.min(1, rms / this.levelRef);
+    f.level = silent ? 0 : f.level + (lv - f.level) * (1 - Math.exp(-dt / (lv > f.level ? 0.04 : 0.15)));
+    f.energy += (f.level - f.energy) * (1 - Math.exp(-dt / ENERGY_TAU));
+
+    this.updateWaveform(peak, dt);
+
     // AGC reference: fast attack, slow release towards a floor (never amplifies noise to full scale)
     if (frameMax > this.agcRef) this.agcRef += (frameMax - this.agcRef) * (1 - Math.exp(-dt / AGC_ATTACK));
     else this.agcRef = Math.max(AGC_FLOOR, this.agcRef * Math.exp(-dt / (silent ? AGC_RELEASE_SILENT : AGC_RELEASE)));
 
     const g = silent ? 0 : 1 / this.agcRef;
-    const atk = 1 - Math.exp(-dt / BAND_ATTACK), rel = 1 - Math.exp(-dt / BAND_RELEASE);
+    const atk = 1 - Math.exp(-dt / BAND_ATTACK), rel = 1 - Math.exp(-dt / (silent ? BAND_RELEASE_SILENT : BAND_RELEASE));
     let flux = 0;
     for (let b = 0; b < BAND_COUNT; b++) {
       let v = raw[b] * g;
@@ -226,10 +236,15 @@ export class FeatureExtractor {
       this.prevRaw[b] = v;
       raw[b] = v;
       const s = bands[b];
-      bands[b] = s + (v > s ? atk : rel) * (v - s);
+      const nb = s + (v > s ? atk : rel) * (v - s);
+      bands[b] = silent && nb < 0.004 ? 0 : nb;
     }
-    f.sub = this.group(0); f.bass = this.group(1); f.lowMid = this.group(2);
-    f.mid = this.group(3); f.highMid = this.group(4); f.treble = this.group(5);
+    if (silent) {
+      f.sub = f.bass = f.lowMid = f.mid = f.highMid = f.treble = 0;
+    } else {
+      f.sub = this.group(0); f.bass = this.group(1); f.lowMid = this.group(2);
+      f.mid = this.group(3); f.highMid = this.group(4); f.treble = this.group(5);
+    }
 
     // ---- onset (spectral flux) ---------------------------------------------------------------------------------------
     if (flux > this.fluxRef) this.fluxRef += (flux - this.fluxRef) * (1 - Math.exp(-dt / 0.1));
@@ -401,8 +416,9 @@ export class FeatureExtractor {
     for (let k = 1; k <= 3 && k <= n; k++) {
       let ibi = t - times[(n - k) % BEAT_HISTORY];
       if (ibi < 0.15 || ibi > 6) continue;
-      while (ibi < 60 / BPM_MAX) ibi *= 2;
-      while (ibi > 60 / BPM_MIN) ibi /= 2;
+      // fold into the tempo range with some slack, so jitter around 60 / 180 BPM does not flip the octave
+      while (ibi < 60 / BPM_MAX - FOLD_EPS) ibi *= 2;
+      while (ibi > 60 / BPM_MIN + FOLD_EPS) ibi /= 2;
       const pos = 60 / ibi - BPM_MIN;
       const w = k === 1 ? 1 : k === 2 ? 0.6 : 0.4;
       if (k === 1) for (let i = 0; i < HIST_BINS; i++) this.hist[i] *= 0.9;
@@ -432,7 +448,19 @@ export class FeatureExtractor {
 
     const f = this.f;
     if (f.bpm === 0) { f.bpm = cand; this.pending = 0; this.lockGrid(t); return; }
-    if (Math.abs(cand - f.bpm) < f.bpm * 0.025) { f.bpm += 0.25 * (cand - f.bpm); this.pending = 0; return; }
+    if (Math.abs(cand - f.bpm) < f.bpm * 0.025) { f.bpm += 0.25 * (cand - f.bpm); this.pending = 0; this.octaveSince = -1; return; }
+    if (Math.abs(Math.abs(Math.log2(cand / f.bpm)) - 1) < 0.08) {
+      // double / half of the current tempo: switch only when it clearly out-weighs the current one for a while
+      this.pending = 0;
+      const cur = Math.round(f.bpm) - BPM_MIN;
+      let curW = 0;
+      for (let j = Math.max(0, cur - 4); j <= Math.min(HIST_BINS - 1, cur + 4); j++) curW += hist[j];
+      if (best < OCTAVE_MARGIN * curW) { this.octaveSince = -1; return; }
+      if (this.octaveSince < 0) this.octaveSince = t;
+      if (t - this.octaveSince >= OCTAVE_HOLD) { f.bpm = cand; this.octaveSince = -1; this.lockGrid(t); }
+      return;
+    }
+    this.octaveSince = -1;
     // a different tempo must win several times in a row before the grid moves
     if (this.pending > 0 && Math.abs(cand - this.pendingBpm) < this.pendingBpm * 0.03) this.pending++;
     else { this.pending = 1; this.pendingBpm = cand; }

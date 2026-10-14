@@ -97,6 +97,29 @@ export class VisualizerManager {
     for (const a of this.active) a.preset.setOpacity(a.opacity);
   }
 
+  /** Rebuild every preset at a new quality level (counts/mesh density are fixed at init). */
+  setQuality(quality: QualityLevel): void {
+    if (quality === this.ctx.quality) return;
+    this.ctx.quality = quality;
+    for (const a of this.active) this.opts.scene.remove(a.preset.group);
+    this.active = [];
+    for (const inst of this.instances.values()) inst.dispose();
+    this.instances.clear();
+    this.background.dispose();
+    this.opts.scene.remove(this.background.group);
+    this.background = new AuroraBackground();
+    this.background.init(this.ctx);
+    this.opts.scene.add(this.background.group);
+    this.environment.dispose();
+    this.opts.scene.remove(this.environment.group);
+    this.environment = new Environment(this.paletteCtl.state, quality);
+    this.environment.setPixelRatio(this.opts.renderer.getPixelRatio());
+    this.opts.scene.add(this.environment.group);
+    const id = this.currentId;
+    this.currentId = '';
+    if (id) this.setPreset(id, true);
+  }
+
   setPalette(id: string, immediate = false): void {
     const p = PALETTES.find((x) => x.id === id);
     if (!p) return;

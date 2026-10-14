@@ -56,15 +56,19 @@ let apiPromise: Promise<YTNamespace> | null = null;
 function loadApi(): Promise<YTNamespace> {
   if (window.YT?.Player) return Promise.resolve(window.YT);
   apiPromise ??= new Promise<YTNamespace>((resolve, reject) => {
-    const fail = (msg: string) => { apiPromise = null; reject(new Error(msg)); };
+    let timer = 0;
+    const fail = (msg: string) => { clearTimeout(timer); apiPromise = null; reject(new Error(msg)); };
     const prev = window.onYouTubeIframeAPIReady;
-    window.onYouTubeIframeAPIReady = () => { prev?.(); if (window.YT?.Player) resolve(window.YT); else fail('YouTube player failed to initialise.'); };
+    window.onYouTubeIframeAPIReady = () => {
+      prev?.();
+      if (window.YT?.Player) { clearTimeout(timer); resolve(window.YT); } else fail('YouTube player failed to initialise.');
+    };
     const s = document.createElement('script');
     s.src = 'https://www.youtube.com/iframe_api';
     s.async = true;
     s.onerror = () => fail('Could not load the YouTube player (offline, or youtube.com is blocked).');
     document.head.appendChild(s);
-    setTimeout(() => fail('Timed out loading the YouTube player.'), 15000);
+    timer = window.setTimeout(() => fail('Timed out loading the YouTube player.'), 15000);
   });
   return apiPromise;
 }
@@ -93,6 +97,11 @@ export class YouTubePlayer {
   private player: YTRawPlayer | null = null;
   private ready: Promise<YTRawPlayer> | null = null;
   private volume = 100;
+  /** Bumped by every load() and stop(): work that belongs to an older generation is dropped */
+  private loadGen = 0;
+  /** stopVideo() was called on a started video: the 'cued' state it produces arrives late and must not be reported */
+  private staleCued = false;
+  private staleCuedAt = 0;
 
   constructor(private events: YtEvents) {}
 
@@ -115,7 +124,7 @@ export class YouTubePlayer {
         playerVars: playerVars(),
         events: {
           onReady: () => { clearTimeout(timer); this.player = p; p.setVolume(this.volume); resolve(p); },
-          onStateChange: (e) => { const s = STATES[e.data]; if (s) this.events.onState(s); },
+          onStateChange: (e) => this.onRawState(e.data),
           onError: (e) => this.events.onError(errorMessage(e.data)),
         },
       });
@@ -136,14 +145,35 @@ export class YouTubePlayer {
   }
 
   async load(videoId: string, start = 0): Promise<void> {
+    const gen = ++this.loadGen;
     const p = await this.ensure();
+    if (gen !== this.loadGen) return; // stop() or a newer load() came in while the player was starting up
     p.setVolume(this.volume);
     p.loadVideoById({ videoId, startSeconds: start });
   }
 
+  private onRawState(code: number): void {
+    const s = STATES[code];
+    if (!s) return;
+    if (s === 'cued') {
+      // the echo of our own stopVideo() (the previous video) arrives after the next load() has already been requested
+      if (this.staleCued && performance.now() - this.staleCuedAt < 5000) { this.staleCued = false; return; }
+    } else {
+      this.staleCued = false; // the new video is reporting: anything stale came before this
+    }
+    this.events.onState(s);
+  }
+
   play(): void { this.call((p) => p.playVideo()); }
   pause(): void { this.call((p) => p.pauseVideo()); }
-  stop(): void { this.call((p) => p.stopVideo()); }
+  stop(): void {
+    this.loadGen++;
+    // stopVideo() only changes state (to 'cued') when a video was started
+    const st = this.read((p) => p.getPlayerState(), -1);
+    this.staleCued = st === 0 || st === 1 || st === 2 || st === 3;
+    this.staleCuedAt = performance.now();
+    this.call((p) => p.stopVideo());
+  }
   seek(seconds: number): void { this.call((p) => p.seekTo(Math.max(0, seconds), true)); }
   setVolume(v01: number): void {
     this.volume = Math.round(Math.min(1, Math.max(0, v01)) * 100);
@@ -161,6 +191,8 @@ export class YouTubePlayer {
     const p = this.player;
     this.player = null;
     this.ready = null;
+    this.loadGen++;
+    this.staleCued = false;
     try { p?.destroy(); } catch { /* already gone */ }
   }
 

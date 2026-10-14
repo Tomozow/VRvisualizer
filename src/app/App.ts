@@ -7,6 +7,7 @@ import { DomOverlay } from '@/ui/dom/Overlay';
 import { Store, type Actions, type AppState } from '@/app/Store';
 import type { VizParams } from '@/viz/types';
 import { detectQuality, clamp } from '@/util/device';
+import type { QualityLevel } from '@/viz/types';
 
 const SETTINGS_KEY = 'resonance-vr.settings.v1';
 
@@ -18,6 +19,7 @@ interface PersistedSettings {
   cycleSeconds?: number;
   volume?: number;
   proxyUrl?: string;
+  quality?: QualityLevel;
 }
 
 /**
@@ -44,7 +46,7 @@ export class App implements Actions {
 
   constructor(private container: HTMLElement, private overlayRoot: HTMLElement) {
     this.settings = loadSettings();
-    const quality = detectQuality();
+    const quality: QualityLevel = this.settings.quality ?? detectQuality();
 
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
@@ -116,6 +118,7 @@ export class App implements Actions {
       xrSupported: false,
       playback: this.engine.playback,
       fps: 0,
+      quality,
       toast: null,
     };
     this.store = new Store(initial);
@@ -132,7 +135,7 @@ export class App implements Actions {
       if (m) this.toast(m, 4000);
     });
 
-    this.overlay = new DomOverlay(overlayRoot, this.store, this);
+    this.overlay = new DomOverlay(overlayRoot, this.store, this, this.engine.features);
     this.engine.setYouTubeHost(this.overlay.youtubeHost);
 
     this.vrui = new VRUI({
@@ -338,10 +341,29 @@ export class App implements Actions {
     this.cycleTimer = 0;
     this.store.set({ autoCycle: on });
   }
+  setQuality(q: QualityLevel): void {
+    if (q === this.store.state.quality) return;
+    this.viz.setQuality(q);
+    this.renderer.xr.setFoveation(q === 'high' ? 0 : 1);
+    if (!this.renderer.xr.isPresenting) {
+      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, q === 'high' ? 2 : 1));
+      this.onResize();
+    }
+    this.settings.quality = q;
+    this.store.set({ quality: q });
+    this.persist();
+  }
 
   play(index?: number): void { void this.engine.resume().then(() => this.engine.play(index)); }
   pause(): void { this.engine.pause(); }
-  toggle(): void { void this.engine.resume().then(() => this.engine.toggle()); }
+  toggle(): void {
+    // Pressing play with nothing queued (and no live mic) should never be a silent no-op.
+    if (this.engine.playback.queue.length === 0 && !this.engine.playback.micEnabled) {
+      this.startDemo();
+      return;
+    }
+    void this.engine.resume().then(() => this.engine.toggle());
+  }
   next(): void { void this.engine.next(); }
   prev(): void { void this.engine.prev(); }
   seek(seconds: number): void { this.engine.seek(seconds); }
@@ -363,7 +385,10 @@ export class App implements Actions {
     void this.engine.resume().then(() => this.engine.addUrl(url, true));
   }
   enableMic(): void {
-    void this.engine.resume().then(() => this.engine.enableMic()).catch((e: Error) => this.toast('Microphone: ' + e.message, 4000));
+    void this.engine.resume().then(() => this.engine.enableMic()).catch((e: Error) => {
+      if (e.name === 'AbortError') return;
+      this.toast(e.message, 5000);
+    });
   }
   disableMic(): void { this.engine.disableMic(); }
   startDemo(): void { void this.engine.resume().then(() => this.engine.startDemo()); }
@@ -391,6 +416,7 @@ export class App implements Actions {
       cycleSeconds: s.cycleSeconds,
       volume: this.settings.volume,
       proxyUrl: this.settings.proxyUrl,
+      quality: this.settings.quality,
     };
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(data)); } catch { /* ignore */ }
   }

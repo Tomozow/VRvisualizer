@@ -1,5 +1,5 @@
 import type { PlaybackState } from '@/audio/types';
-import type { PresetInfo, VizParams, Palette } from '@/viz/types';
+import type { PresetInfo, VizParams, Palette, QualityLevel } from '@/viz/types';
 
 export type UiMode = '2d' | 'xr';
 
@@ -23,6 +23,8 @@ export interface AppState {
   playback: PlaybackState;
   /** FPS estimate for the settings tab */
   fps: number;
+  /** Rendering quality (particle counts, mesh density, foveation) */
+  quality: QualityLevel;
   /** Short transient notification shown in both UIs */
   toast: { text: string; until: number } | null;
 }
@@ -83,6 +85,8 @@ export interface Actions {
   nextPalette(): void;
   setParam<K extends keyof VizParams>(key: K, value: VizParams[K]): void;
   setAutoCycle(on: boolean): void;
+  /** Switch rendering quality at runtime (presets are rebuilt). */
+  setQuality(q: QualityLevel): void;
   // transport
   play(index?: number): void;
   pause(): void;

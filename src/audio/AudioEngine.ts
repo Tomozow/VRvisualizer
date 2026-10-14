@@ -9,7 +9,7 @@ import {
 } from './types';
 import { FeatureExtractor } from './analysis/FeatureExtractor';
 import { ElementPlayer } from './sources/ElementPlayer';
-import { MicSource } from './sources/MicSource';
+import { MicSource, abortError, isAbortError } from './sources/MicSource';
 import { DemoSource } from './sources/DemoSource';
 import { YouTubePlayer, type YtState } from './youtube/YouTubePlayer';
 import { isMixList, parseYouTube, youtubeThumbnail, type YouTubeRef } from './youtube/parse';
@@ -22,6 +22,7 @@ type WebkitWindow = Window & { webkitAudioContext?: typeof AudioContext };
 const AUTOPLAY_HINT = 'Press play in the video if it does not start (autoplay was blocked).';
 const MIC_HINT = 'Visuals cannot follow this YouTube video without the microphone (or a YouTube proxy, see Settings).';
 const TIME_POLL = 0.1; // s between currentTime/duration refreshes
+const RESUME_RETRY_MS = 3000; // while the context is suspended but audio is wanted: how often update() retries resume()
 
 let uidCounter = 0;
 const uid = (prefix: string) => `${prefix}${(++uidCounter).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -55,6 +56,9 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
   private micExplicit = false;
   private live = false;
   private token = 0;
+  /** bumped by disableMic(): a microphone request started before the bump is cancelled */
+  private micReq = 0;
+  private lastResumeTry = 0;
   private errorStreak = 0;
   /** tracks whose proxy stream failed: they fall back to the YouTube player + microphone */
   private readonly proxyFailed = new Set<string>();
@@ -98,8 +102,35 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
   async resume(): Promise<void> {
     const ctx = this.ensureContext();
     if (ctx.state === 'running') return;
-    // resume() can stay pending without a user gesture: never block callers for long
-    await Promise.race([ctx.resume().catch(() => undefined), new Promise<void>((r) => window.setTimeout(r, 600))]);
+    // Every call makes a fresh attempt (nothing is remembered from an earlier one that stayed pending or was refused).
+    // ctx.resume() can stay pending without a user gesture: never block callers for long.
+    this.lastResumeTry = performance.now();
+    let timer = 0;
+    const attempt = ctx.resume().catch(() => undefined);
+    const patience = new Promise<void>((r) => { timer = window.setTimeout(r, 600); });
+    await Promise.race([attempt, patience]);
+    window.clearTimeout(timer);
+  }
+
+  /** Something is loaded or open that needs a running context (analysis, element / demo playback) */
+  private wantsAudio(): boolean {
+    return this.pb.playing || this.mode !== null || this.mic.isOpen;
+  }
+
+  /**
+   * Start resuming a suspended context right now, synchronously inside the caller (the click / XR select that
+   * triggered a transport action may be the only user activation we get). Later awaits join the same context.
+   */
+  private kickResumeNow(): void {
+    if (this.ctx && this.ctx.state !== 'running') void this.resume();
+  }
+
+  /** Fire-and-forget resume() for the places that cannot wait (state changes, frame loop) */
+  private kickResume(): void {
+    const ctx = this.ctx;
+    if (!ctx || ctx.state === 'running' || ctx.state === 'closed') return;
+    this.lastResumeTry = performance.now();
+    void ctx.resume().catch(() => undefined);
   }
 
   update(): void {
@@ -109,6 +140,8 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     const f = this.features;
     const ctx = this.ctx;
     const running = ctx !== null && ctx.state === 'running';
+    // no DOM gesture exists inside an immersive session: keep asking for the context back while audio is wanted
+    if (ctx !== null && ctx.state === 'suspended' && now - this.lastResumeTry > RESUME_RETRY_MS && this.wantsAudio()) this.kickResume();
 
     const input = this.pb.analysisInput;
     const node = !running ? null : input === 'mic' ? this.micAnalyser : input === 'element' ? this.analyser : null;
@@ -136,8 +169,10 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     if (this.ctx) return this.ctx;
     const Ctor = window.AudioContext ?? (window as WebkitWindow).webkitAudioContext;
     if (!Ctor) throw new Error('This browser does not support Web Audio.');
-    const ctx = new Ctor({ latencyHint: 'interactive' });
+    // 'playback': larger buffers, so audio does not crackle when an XR session keeps the main thread busy
+    const ctx = new Ctor({ latencyHint: 'playback' });
     this.ctx = ctx;
+    ctx.onstatechange = () => { if (ctx.state === 'suspended' && this.wantsAudio()) this.kickResume(); };
     this.bus = ctx.createGain();
     this.master = ctx.createGain();
     this.master.gain.value = this.pb.volume;
@@ -377,6 +412,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
 
   // ------------------------------------------------------------------------------------------------- transport
   async play(index?: number): Promise<void> {
+    this.kickResumeNow();
     const pb = this.pb;
     if (index !== undefined) {
       if (index < 0 || index >= pb.queue.length) return;
@@ -410,6 +446,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
   }
 
   async toggle(): Promise<void> {
+    this.kickResumeNow();
     if (this.pb.playing) this.pause();
     else await this.play();
   }
@@ -476,12 +513,30 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     this.dispatchEvent(new Event('ended'));
     const n = this.pickNext(true);
     if (n >= 0) {
+      if (n === this.pb.index && this.replay()) return; // repeat one: loop in place instead of reloading the source
       this.order.remember(this.pb.track?.id);
       void this.startTrack(n);
       return;
     }
     this.stopOutputs();
     this.set({ playing: false, currentTime: 0 });
+  }
+
+  /** Play the current track again from 0 without reloading it (URL / proxy streams would be downloaded again) */
+  private replay(): boolean {
+    if (this.mode === 'element') {
+      this.set({ currentTime: 0 });
+      const token = this.token;
+      this.element.restart().catch((e: Error) => { if (token === this.token) this.onSourceError(e.message); });
+      return true;
+    }
+    if (this.mode === 'youtube') {
+      this.yt.seek(0);
+      this.yt.play(); // seekTo() alone leaves an ended video stopped on some platforms
+      this.set({ currentTime: 0 });
+      return true;
+    }
+    return false;
   }
 
   /** Fatal problem with the current source: show it and skip ahead when there is somewhere to go */
@@ -510,8 +565,11 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     this.element.unload();
     this.yt.stop();
     this.demo?.stop();
-    if (!keepMic && !this.micExplicit && this.mic.isOpen) this.disableMic();
+    if (!keepMic && !this.micExplicit && this.micBusy()) this.disableMic();
   }
+
+  /** The microphone is open, or a request for it is still pending (permission prompt) */
+  private micBusy(): boolean { return this.mic.isOpen || this.mic.isOpening; }
 
   // --------------------------------------------------------------------------------------------- track start
   private async startTrack(index: number): Promise<void> {
@@ -530,7 +588,9 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     try {
       if (track.kind === 'mic') {
         await this.enableMic();
-        this.set({ status: 'ready', playing: true });
+        if (token !== this.token) return;
+        // enableMic() resolves without opening the mic when disableMic() cancelled it meanwhile
+        this.set(this.pb.micEnabled ? { status: 'ready', playing: true } : { status: 'ready', playing: false });
         return;
       }
       if (track.kind === 'youtube' && !proxied) {
@@ -539,7 +599,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
         return;
       }
       // everything else plays through the Web Audio graph; the microphone is not needed
-      if (this.mic.isOpen) this.disableMic();
+      if (this.micBusy()) this.disableMic();
       this.micExplicit = false;
       await this.resume();
       if (token !== this.token) return;
@@ -570,7 +630,8 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
   private async startYouTube(track: Track, token: number): Promise<void> {
     this.mode = 'youtube';
     void this.resume();
-    const mic = this.openMic(false).catch((e: Error) => {
+    const mic = this.openMic(false, token).catch((e: Error) => {
+      if (isAbortError(e)) return; // cancelled (track changed, mic disabled): nothing to report
       if (token === this.token) this.report(`${e.message} ${MIC_HINT}`);
     });
     await this.yt.load(track.youtubeId!);
@@ -632,6 +693,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     try {
       await this.openMic(true);
     } catch (e) {
+      if (isAbortError(e)) return; // disableMic() (or a newer track) cancelled this request: not an error, and not ours to undo
       this.micExplicit = false;
       this.set({ message: (e as Error).message });
       throw e;
@@ -642,18 +704,29 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     this.set({ micEnabled: true, message: undefined });
   }
 
-  private async openMic(explicit: boolean): Promise<void> {
+  /**
+   * Open the microphone. Rejects with an AbortError (see isAbortError) when the request is no longer wanted by the
+   * time the permission prompt is answered: disableMic() was called, or (`token` given) the track changed.
+   */
+  private async openMic(explicit: boolean, token?: number): Promise<void> {
     if (this.mic.isOpen) { this.set({ micEnabled: true }); return; }
+    const req = this.micReq;
+    const wanted = () => req === this.micReq && (token === undefined || token === this.token);
     const ctx = this.ensureContext();
     await this.resume();
+    if (!wanted()) throw abortError();
     this.micAnalyser ??= this.makeAnalyser(ctx);
     await this.mic.open(ctx, this.micAnalyser);
+    // Not wanted any more: disableMic() already closed (and aborted) the capture it cancelled, so the stream that is
+    // open here belongs to a newer request that shares it (a YouTube track replacing another one, an explicit enable).
+    if (!wanted()) throw abortError();
     if (!explicit) this.extractor.resetBeat();
     this.set({ micEnabled: true });
   }
 
   disableMic(): void {
     this.micExplicit = false;
+    this.micReq++;
     this.mic.close();
     this.set({ micEnabled: false });
     this.extractor.resetBeat();
@@ -702,6 +775,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     for (const id of [...this.objectUrls.keys()]) this.revoke(id);
     const ctx = this.ctx;
     this.ctx = null;
+    if (ctx) ctx.onstatechange = null;
     if (ctx && ctx.state !== 'closed') void ctx.close().catch(() => undefined);
   }
 }

@@ -83,6 +83,24 @@ export class ElementPlayer {
 
   pause(): void { this.el.pause(); }
 
+  /**
+   * Play the loaded track again from the start (repeat one) without fetching it again. Falls back to reloading only
+   * when the element cannot seek back: a proxied stream that was restarted at an offset, or a non-seekable response.
+   */
+  async restart(): Promise<void> {
+    if (!this.loaded) return;
+    const el = this.el;
+    if (this.kind === 'proxy' && this.offset > 0) {
+      this.offset = 0;
+      el.src = this.base;
+      el.load();
+    } else {
+      try { el.currentTime = 0; } catch { /* no metadata yet: play() below starts from the beginning anyway */ }
+      if (el.seekable.length === 0 || el.seekable.start(0) > 0) el.load();
+    }
+    await this.play();
+  }
+
   /** @returns false when the source cannot seek */
   seek(seconds: number): boolean {
     const s = Math.max(0, seconds);
