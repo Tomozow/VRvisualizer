@@ -24,3 +24,26 @@ Reviewers score every scene and both UIs against this list. Anything below "good
 ## 2D UI
 * First-time user understands what to do within 5 s (welcome hint). Drag-and-drop works. Touch targets ≥ 44 px. Responsive.
 * YouTube flow: paste → plays → mic auto-enabled → visuals react; clear messaging about loop-back and the optional proxy.
+
+## Status (last art-director re-score, headless SwiftShader stills, demo track)
+Cells below 7 went from 12 to 5 across the last fix round; none is below 6.
+
+| Scene | Depth | Lum | Music | Motion | Comp | Colour | Comfort | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| Spectrum Cathedral | 7 | 7 | 8 | 7 | 7 | 7 | 7 | ships |
+| Nebula | 7 | 8 | 7 | 8 | 8 | 8 | 8 | ships |
+| Pulse Core | 7 | 7 | 8 | 7 | 8 | 7 | 7 | ships |
+| Wave Tunnel | 8 | 7 | 7 | 6 | 7 | 6 | 7 | not yet |
+| Spectral Terrain | 7 | 6 | 7 | 7 | 6 | 7 | 7 | not yet |
+| Liquid Orbit | 7 | 7 | 7 | 7 | 6 | 7 | 7 | not yet |
+
+Remaining fixes on record (one line each, not yet applied):
+* Tunnel motion: fade the ring-ripple amplitude with depth beyond ≈12 m so inner rings stay round (sawtooth / moiré crawl).
+* Tunnel colour: extend the far end of the gradient ramp to the magenta→violet stops in Neon Sunset; avoid the murky red centre.
+* Terrain luminance: drop the ceiling's flat base fill to ≈0.1 alpha and keep only the glowing grid lines.
+* Terrain composition: cap crest height to ≈1 m in the sector in front of the sun; soften the V crease at the mirror centre.
+* Orbit composition: thin/dim ribbons below the horizon and in the near field; enlarge the core ≈1.5×.
+* Set-wide: the shared floor grid + pool arcs make scenes look alike and read khaki under orange ribbons — consider per-scene floor tinting.
+
+Not verified in this environment: real Quest 2 GPU timing, hand tracking, microphone loop-back with a real YouTube stream, and
+motion/musicality on real audio (stills cannot prove them).
