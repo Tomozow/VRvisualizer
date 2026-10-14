@@ -153,7 +153,38 @@ export class App implements Actions {
       }
     });
 
+    this.applyQueryParams();
     this.renderer.setAnimationLoop(() => this.frame());
+  }
+
+  /** Test / deep-link hooks: ?demo=1 ?preset=id ?palette=id ?nomenu=1 ?youtube=<url or id> ?url=<audio url> */
+  private applyQueryParams(): void {
+    const q = new URLSearchParams(location.search);
+    const preset = q.get('preset');
+    if (preset) this.setPreset(preset);
+    const palette = q.get('palette');
+    if (palette) this.setPalette(palette);
+    if (q.get('nomenu') === '1') this.store.set({ menuVisible: false });
+    const yt = q.get('youtube');
+    const url = q.get('url');
+    const demo = q.get('demo') === '1';
+    if (!(yt || url || demo)) return;
+    const start = () => {
+      if (yt) this.addUrl(yt);
+      else if (url) this.addUrl(url);
+      else this.startDemo();
+    };
+    // Autoplay policies: try immediately, and again on the first user gesture if the context stayed suspended.
+    start();
+    const once = () => {
+      window.removeEventListener('pointerdown', once);
+      window.removeEventListener('keydown', once);
+      if (this.engine.features.active) return;
+      if (demo) start();
+      else void this.engine.resume().then(() => { if (!this.engine.playback.playing) void this.engine.play(); });
+    };
+    window.addEventListener('pointerdown', once);
+    window.addEventListener('keydown', once);
   }
 
   // --------------------------------------------------------------------- loop
