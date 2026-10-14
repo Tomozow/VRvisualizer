@@ -64,7 +64,7 @@ uniform sampler2D uFreqHistory;
 uniform sampler2D uWaveHistory;
 uniform float uHistoryHead;
 uniform float uHistoryRows;
-// v coordinate of the row that is `age` frames old (0 = newest)
+// v coordinate of the row that is "age" frames old (0 = newest)
 float histV(float age) {
   return (uHistoryHead - age + 0.5) / uHistoryRows;
 }

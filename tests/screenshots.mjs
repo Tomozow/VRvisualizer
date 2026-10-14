@@ -12,6 +12,7 @@ const outDir = resolve('tests/out');
 mkdirSync(outDir, { recursive: true });
 
 const browser = await chromium.launch({
+  executablePath: process.env.CHROME_PATH || undefined,
   args: [
     '--use-gl=angle',
     '--use-angle=swiftshader',
@@ -29,7 +30,7 @@ page.on('console', (m) => {
 });
 page.on('pageerror', (e) => errors.push(`[pageerror] ${e.message}`));
 
-await page.goto(base + '?demo=1&quality=low&nowelcome=1', { waitUntil: 'load' });
+await page.goto(base + '?demo=1&quality=medium&nowelcome=1', { waitUntil: 'load' });
 await page.waitForFunction(() => !!window.app, null, { timeout: 20000 });
 // Some browsers need a gesture before audio starts
 await page.mouse.click(800, 450);
@@ -40,16 +41,25 @@ const palettes = await page.evaluate(() => window.app.store.state.palettes.map((
 console.log('presets:', presets.join(', '));
 console.log('palettes:', palettes.join(', '));
 
+// Warm-up pass: instantiate every preset once so shader compilation (slow under SwiftShader)
+// does not eat into the crossfade / settle time of the screenshot pass.
+for (const id of presets) {
+  await page.evaluate((id) => window.app.setPreset(id), id);
+  await page.waitForTimeout(1200);
+}
+
 const report = [];
 for (let i = 0; i < presets.length; i++) {
   const id = presets[i];
   const pal = palettes[i % palettes.length];
   await page.evaluate(({ id, pal }) => {
-    window.app.setPreset(id);
-    window.app.setPalette(pal);
-    window.app.setMenuVisible(false);
+    // Switch instantly: software rendering here is far too slow for the 1.2 s crossfade to settle.
+    window.app.overlay.setHidden(true);
+    window.app.viz.setPreset(id, true);
+    window.app.viz.setPalette(pal, true);
+    window.app.store.set({ preset: id, palette: pal, menuVisible: false });
   }, { id, pal });
-  await page.waitForTimeout(2500);
+  await page.waitForTimeout(3000);
   const stats = await page.evaluate(() => {
     const r = window.app.renderer.info.render;
     const f = window.app.engine.features;

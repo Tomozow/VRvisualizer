@@ -13,6 +13,7 @@ mkdirSync(outDir, { recursive: true });
 const iwerSrc = readFileSync(resolve('node_modules/iwer/build/iwer.min.js'), 'utf8');
 
 const browser = await chromium.launch({
+  executablePath: process.env.CHROME_PATH || undefined,
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist',
     '--autoplay-policy=no-user-gesture-required', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'],
 });
@@ -24,7 +25,7 @@ page.on('pageerror', (e) => errors.push(`[pageerror] ${e.message}`));
 await page.addInitScript(iwerSrc + `
   ;(() => {
     const device = new IWER.XRDevice(IWER.metaQuest2);
-    device.installRuntime();
+    device.installRuntime({ forceInstall: true });
     device.position.set(0, 1.6, 0);
     window.__xr = device;
   })();

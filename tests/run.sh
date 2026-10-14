@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build, serve dist on :4173 and run the headless screenshot + XR emulation tests.
 set -euo pipefail
+# Use the pre-installed Chromium when Playwright's own download is missing
+if [ -z "${CHROME_PATH:-}" ]; then for c in /opt/pw-browsers/chromium-*/chrome-linux/chrome; do [ -x "$c" ] && export CHROME_PATH="$c"; done; fi
 cd "$(dirname "$0")/.."
 npm run build >/tmp/build.log 2>&1 || { tail -40 /tmp/build.log; exit 1; }
 npx vite preview --port 4173 --strictPort >/tmp/preview.log 2>&1 &

@@ -37,7 +37,7 @@ export class App implements Actions {
   private clock = new THREE.Clock();
   private elapsed = 0;
   private cycleTimer = 0;
-  private fpsAccum = 0;
+  private fpsWindowStart = performance.now();
   private fpsFrames = 0;
   private xrSession: XRSession | null = null;
   private settings: PersistedSettings = {};
@@ -206,12 +206,12 @@ export class App implements Actions {
       }
     }
 
-    // fps estimate (1 s window)
-    this.fpsAccum += dt;
+    // fps estimate over a 1 s wall-clock window (dt above is clamped, so do not reuse it)
+    const now = performance.now();
     this.fpsFrames++;
-    if (this.fpsAccum >= 1) {
-      this.store.set({ fps: Math.round(this.fpsFrames / this.fpsAccum) });
-      this.fpsAccum = 0;
+    if (now - this.fpsWindowStart >= 1000) {
+      this.store.set({ fps: Math.round((this.fpsFrames * 1000) / (now - this.fpsWindowStart)) });
+      this.fpsWindowStart = now;
       this.fpsFrames = 0;
     }
     if (s.toast && performance.now() > s.toast.until) this.store.set({ toast: null });
