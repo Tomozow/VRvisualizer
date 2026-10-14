@@ -21,7 +21,7 @@ const AGC_ATTACK = 0.08;        // s
 const AGC_RELEASE = 4;          // s (e-fold)
 const AGC_RELEASE_SILENT = 1.2; // faster reference decay while the input is silent
 const CONTRAST = 1.4;           // power curve after AGC: dB scale looks flat otherwise
-const BAND_ATTACK = 0.03;       // s
+const BAND_ATTACK = 0.045;      // s (slightly softened so large geometry does not jump)
 const BAND_RELEASE = 0.35;      // s
 
 // ---- loudness / silence -----------------------------------------------------------------------------------------
@@ -45,7 +45,7 @@ const GRID_TOL = 0.2;           // events within ±20 % of a period of the beat 
 const OFF_GRID_ACCEPT = 0.7;    // off-grid events still count as beats when this strong relative to on-grid ones
 const OFF_STREAK_RESET = 6;     // this many off-grid events in a row invalidate the tempo
 const HALF_BEAT_ACCEPT = 1.2;   // ... and this strong when they sit on the off-beat (bass lines live there)
-const REFRACTORY_MIN = 0.12;
+const REFRACTORY_MIN = 0.2;  // ≥ 200 ms between visual beat events (≤ 5 Hz; typical music ≈ 2–3 Hz)
 const REFRACTORY_MAX = 0.3;
 const BEAT_ENV_TAU = 0.12;      // s; 350 ms → ≈5 %
 const WARMUP = 0.6;             // s of data before beats can fire
@@ -347,7 +347,7 @@ export class FeatureExtractor {
   private fire(t: number, rel: number): void {
     const f = this.f;
     const period = f.bpm > 0 ? 60 / f.bpm : 0;
-    const refractory = period > 0 ? Math.min(REFRACTORY_MAX, Math.max(REFRACTORY_MIN, period * 0.35)) : REFRACTORY_MIN;
+    const refractory = period > 0 ? Math.min(REFRACTORY_MAX, Math.max(REFRACTORY_MIN, period * 0.45)) : REFRACTORY_MIN;
     if (t - this.lastBeat < refractory) return;
     f.beat = true;
     f.beatEnv = 1;

@@ -67,7 +67,7 @@ export class Environment {
     this.stars.frustumCulled = false;
     this.group.add(this.stars);
 
-    const floorGeo = new THREE.PlaneGeometry(120, 120, 1, 1);
+    const floorGeo = new THREE.PlaneGeometry(180, 180, 1, 1);
     this.floorMat = new THREE.ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
@@ -75,6 +75,7 @@ export class Environment {
         uBass: { value: 0 },
         uColor: { value: palette.primary },
         uColor2: { value: palette.accent },
+        uColor3: { value: palette.secondary },
         uOpacity: { value: 1 },
       },
       vertexShader: /* glsl */ `
@@ -84,21 +85,35 @@ export class Environment {
           gl_Position = projectionMatrix * viewMatrix * w;
         }`,
       fragmentShader: /* glsl */ `
-        uniform float uTime, uBeat, uBass, uOpacity; uniform vec3 uColor, uColor2;
+        uniform float uTime, uBeat, uBass, uOpacity; uniform vec3 uColor, uColor2, uColor3;
         varying vec2 vUv; varying vec3 vWorld;
+        float gauss(float x, float s) { return exp(-x * x / (2.0 * s * s)); }
         void main() {
           vec2 p = vWorld.xz;
           float r = length(p);
-          // grid lines
-          vec2 g = abs(fract(p * 0.5 - 0.5) - 0.5) / fwidth(p * 0.5);
+          // 1 m grid, anti-aliased, fading out toward 25 m; a finer 0.25 m grid close to the feet
+          vec2 g = abs(fract(p - 0.5) - 0.5) / fwidth(p);
           float line = 1.0 - min(min(g.x, g.y), 1.0);
-          // radial rings travelling outward on beats
-          // thin rings (band width ≈ 0.08 in fract space); smoothstep edges must be ascending or the result is undefined
-          float ringD = abs(fract(r * 0.18 - uTime * 0.25) - 0.5) - 0.42;
-          float ring = (1.0 - smoothstep(0.0, 0.08, ringD)) * step(0.0, ringD) * uBeat * 0.6;
-          float fade = exp(-r * 0.09);
-          vec3 col = uColor * line * 0.35 + uColor2 * ring * 0.8 + uColor * 0.03 * uBass;
-          gl_FragColor = vec4(col * fade, 1.0) * uOpacity;
+          vec2 g2 = abs(fract(p * 4.0 - 0.5) - 0.5) / fwidth(p * 4.0);
+          float fine = (1.0 - min(min(g2.x, g2.y), 1.0)) * (1.0 - smoothstep(2.5, 5.0, r)) * 0.25;
+          float gridFade = exp(-r * 0.045);
+          // soft light pool under the user, breathing with bass
+          float pool = gauss(r, 1.5) * (0.10 + 0.22 * uBass);
+          // static concentric rings that give the floor scale, lifted by bass
+          float rings = (gauss(r - 4.0, 0.10) + gauss(r - 7.0, 0.11) + gauss(r - 10.0, 0.12) + gauss(r - 14.0, 0.14)) * (0.05 + 0.08 * uBass);
+          rings *= exp(-r * 0.035);
+          // one bright ring per beat travelling outward (smoothstep edges ascending)
+          float wave = fract(uTime * 0.3);
+          float wr = wave * 24.0;
+          float beatRing = gauss(r - wr, 0.25 + wave * 0.6) * uBeat * (1.0 - wave) * 0.9;
+          // faint horizon glow far away so the floor never ends in a hard void
+          float horizon = smoothstep(28.0, 52.0, r) * (1.0 - smoothstep(52.0, 85.0, r)) * 0.07;
+          vec3 col = uColor * (line * 0.30 + fine) * gridFade
+                   + uColor * pool
+                   + uColor3 * rings
+                   + uColor2 * beatRing
+                   + uColor3 * horizon;
+          gl_FragColor = vec4(col, 1.0) * uOpacity;
         }`,
       transparent: true,
       depthWrite: false,

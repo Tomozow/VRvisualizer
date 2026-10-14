@@ -10,6 +10,8 @@ export interface Palette {
   stops: string[];
   /** Scene background / fog colour */
   background: string;
+  /** Saturated accent for highlights (beat rings, sparks, UI). Defaults to the last stop. Never white. */
+  accent?: string;
 }
 
 export interface PaletteState {
@@ -49,8 +51,8 @@ export interface AudioTextures {
     uHistoryHead: { value: number };
     uHistoryRows: { value: number };
   };
-  /** Write the current frame's features into the ring buffer. Called once per frame by the manager. */
-  update(features: AudioFeatures): void;
+  /** Write the current frame's features into the ring buffer (one row per 1/72 s of wall-clock time). Called once per frame by the manager. */
+  update(features: AudioFeatures, dt?: number): void;
   dispose(): void;
 }
 

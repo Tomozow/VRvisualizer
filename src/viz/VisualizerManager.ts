@@ -129,7 +129,7 @@ export class VisualizerManager {
   update(features: AudioFeatures, dt: number, t: number, params: VizParams): void {
     this.paletteCtl.update(dt);
     this.fog.color.copy(this.paletteCtl.state.background);
-    this.ctx.textures.update(features);
+    this.ctx.textures.update(features, dt);
     this.environment.update(features, dt, t, params);
 
     this.background.group.visible = params.background;

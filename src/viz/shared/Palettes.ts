@@ -2,13 +2,13 @@ import * as THREE from 'three';
 import type { Palette, PaletteState } from '@/viz/types';
 
 export const PALETTES: Palette[] = [
-  { id: 'neon-sunset', name: 'Neon Sunset', stops: ['#1b0b3a', '#7a1fa2', '#ff3d7f', '#ff9f43', '#fff1a8'], background: '#05030c' },
-  { id: 'cyber-ice', name: 'Cyber Ice', stops: ['#03101f', '#0f4c81', '#1fa2ff', '#7df9ff', '#ffffff'], background: '#020812' },
-  { id: 'aurora', name: 'Aurora', stops: ['#061a1f', '#0b6e4f', '#2ee6a6', '#9cff8a', '#e6fff4'], background: '#02090b' },
-  { id: 'ember', name: 'Ember', stops: ['#1a0500', '#7a1e00', '#ff4d00', '#ffb000', '#fff3c4'], background: '#0a0302' },
-  { id: 'vapor', name: 'Vapor', stops: ['#1a1040', '#5a2ca0', '#ff6ec7', '#7cf5ff', '#fdfdff'], background: '#07051a' },
-  { id: 'ultraviolet', name: 'Ultraviolet', stops: ['#0a0014', '#3a0ca3', '#7209b7', '#f72585', '#ffd6e8'], background: '#040010' },
-  { id: 'mono', name: 'Monochrome', stops: ['#0b0b0f', '#3a3a48', '#9a9ab0', '#e8e8f4', '#ffffff'], background: '#050507' },
+  { id: 'neon-sunset', name: 'Neon Sunset', stops: ['#1b0b3a', '#7a1fa2', '#ff3d7f', '#ff9f43', '#ffe08a'], background: '#05030c', accent: '#ffb84d' },
+  { id: 'cyber-ice', name: 'Cyber Ice', stops: ['#03101f', '#0f4c81', '#1fa2ff', '#7df9ff', '#d9fbff'], background: '#020812', accent: '#5ef2ff' },
+  { id: 'aurora', name: 'Aurora', stops: ['#061a1f', '#0b6e4f', '#2ee6a6', '#9cff8a', '#dcffd0'], background: '#02090b', accent: '#b6ff5c' },
+  { id: 'ember', name: 'Ember', stops: ['#1a0500', '#7a1e00', '#ff4d00', '#ffb000', '#ffe2a0'], background: '#0a0302', accent: '#ffc233' },
+  { id: 'vapor', name: 'Vapor', stops: ['#1a1040', '#5a2ca0', '#ff6ec7', '#7cf5ff', '#e8f6ff'], background: '#07051a', accent: '#7cf5ff' },
+  { id: 'ultraviolet', name: 'Ultraviolet', stops: ['#0a0014', '#3a0ca3', '#7209b7', '#f72585', '#ffb3d9'], background: '#040010', accent: '#ff5fa8' },
+  { id: 'mono', name: 'Monochrome', stops: ['#0b0b0f', '#3a3a48', '#9a9ab0', '#d8d8e8', '#f2f2ff'], background: '#050507', accent: '#cfd2ff' },
 ];
 
 /** Build a 256x1 gradient from colour stops (colours are interpolated in linear RGB). */
@@ -69,7 +69,7 @@ export class PaletteController {
     const n = p.stops.length;
     this.toColors[0].set(p.stops[Math.min(n - 2, Math.max(1, Math.floor(n * 0.5)))]);
     this.toColors[1].set(p.stops[Math.max(0, n - 2)]);
-    this.toColors[2].set(p.stops[n - 1]);
+    this.toColors[2].set(p.accent ?? p.stops[n - 1]);
     this.toColors[3].set(p.background);
     this.t = immediate ? 1 : 0;
     this.apply();

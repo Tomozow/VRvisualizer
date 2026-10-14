@@ -22,6 +22,8 @@ export function createAudioTextures(): AudioTextures {
   const freqData = freqHistory.image.data as Uint8Array;
   const waveData = waveHistory.image.data as Uint8Array;
   let head = HISTORY_ROWS - 1;
+  const ROW_HZ = 72; // one history row per 1/72 s regardless of the display refresh rate
+  let acc = 0;
 
   const textures: AudioTextures = {
     freqHistory,
@@ -33,17 +35,24 @@ export function createAudioTextures(): AudioTextures {
       uHistoryHead: { value: head },
       uHistoryRows: { value: HISTORY_ROWS },
     },
-    update(f: AudioFeatures) {
-      head = (head + 1) % HISTORY_ROWS;
-      const fo = head * BAND_COUNT;
-      for (let i = 0; i < BAND_COUNT; i++) {
-        const v = f.bands[i];
-        freqData[fo + i] = v <= 0 ? 0 : v >= 1 ? 255 : (v * 255) | 0;
-      }
-      const wo = head * WAVE_COUNT;
-      for (let i = 0; i < WAVE_COUNT; i++) {
-        const v = f.waveform[i] * 0.5 + 0.5;
-        waveData[wo + i] = v <= 0 ? 0 : v >= 1 ? 255 : (v * 255) | 0;
+    update(f: AudioFeatures, dt = 1 / ROW_HZ) {
+      acc += dt;
+      let rows = Math.floor(acc * ROW_HZ);
+      if (rows <= 0) return;
+      if (rows > 4) rows = 4; // after a stall, do not flood the buffer with duplicates
+      acc -= rows / ROW_HZ;
+      for (let n = 0; n < rows; n++) {
+        head = (head + 1) % HISTORY_ROWS;
+        const fo = head * BAND_COUNT;
+        for (let i = 0; i < BAND_COUNT; i++) {
+          const v = f.bands[i];
+          freqData[fo + i] = v <= 0 ? 0 : v >= 1 ? 255 : (v * 255) | 0;
+        }
+        const wo = head * WAVE_COUNT;
+        for (let i = 0; i < WAVE_COUNT; i++) {
+          const v = f.waveform[i] * 0.5 + 0.5;
+          waveData[wo + i] = v <= 0 ? 0 : v >= 1 ? 255 : (v * 255) | 0;
+        }
       }
       freqHistory.needsUpdate = true;
       waveHistory.needsUpdate = true;
