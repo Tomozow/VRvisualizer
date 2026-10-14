@@ -2,19 +2,20 @@ import * as THREE from 'three';
 import type { AudioFeatures } from '@/audio/types';
 import type { Preset, PresetContext, QualityLevel, VizParams } from '@/viz/types';
 import { HISTORY_GLSL } from '@/viz/shared/AudioTextures';
+import { OUTPUT_GLSL } from '@/viz/shared/Shading';
 
 const EYE = 1.6;
 /** Frames of band history shown along a ribbon (head = now, tail = this long ago). */
 const AGE_SPAN = 90;
 const CORE_Z = -3.2;
 const CORE_RADIUS = 0.8; // nearest surface is 2.4 m from the head
-const HALO_SIZE = 5; // half-size (m) of the soft halo sprite behind the core
+const HALO_SIZE = 2.7; // half-size (m) of the soft halo sprite behind the core (its edge ramp reaches 0 exactly there)
 const HALO_BASE = 0.02; // resting halo brightness (bass and beat add to it)
 const REFLECTION = 0.2; // alpha of the floor reflection
 const QUALITY: Record<QualityLevel, { main: number; outer: number; far: number; segs: number }> = {
-  low: { main: 16, outer: 10, far: 2, segs: 240 },
-  medium: { main: 24, outer: 14, far: 3, segs: 400 },
-  high: { main: 24, outer: 14, far: 3, segs: 600 },
+  low: { main: 16, outer: 10, far: 2, segs: 160 },
+  medium: { main: 24, outer: 14, far: 3, segs: 240 },
+  high: { main: 24, outer: 14, far: 3, segs: 360 },
 };
 
 const NOISE_GLSL = /* glsl */ `
@@ -81,8 +82,9 @@ vec3 clearHeadAndFloor(vec3 P) {
 }
 
 // Main ribbon: tilted ellipse (semi-axes 1.4..4 m) around the core, own tilt / precession / phase, gentle noise wobble.
-vec3 mainPath(float id, float th, float tm) {
-  float h1 = hash11(id + 1.0), h2 = hash11(id + 17.0), h3 = hash11(id + 41.0), h4 = hash11(id + 73.0), h5 = hash11(id + 101.0), h6 = hash11(id + 131.0);
+// The per-ribbon hashes (hA = h1..h3, hB = h4..h6) are computed once in main() and shared by both path evaluations.
+vec3 mainPath(vec3 hA, vec3 hB, float id, float th, float tm) {
+  float h1 = hA.x, h2 = hA.y, h3 = hA.z, h4 = hB.x, h5 = hB.y, h6 = hB.z;
   float a = mix(1.4, 4.0, h1), b = mix(1.4, 4.0, h2);
   vec2 e = vec2(a * cos(th), b * sin(th));
   float rho = h3 * 6.2831853;
@@ -98,8 +100,9 @@ vec3 mainPath(float id, float th, float tm) {
 }
 
 // Outer / far ribbon: tilted great circle around the listener at 5..7 m (far: 10..14 m), Lissajous wobble, slow noise.
-vec3 outerPath(float oid, float s, float tm, float far) {
-  float h1 = hash11(oid + 201.0), h2 = hash11(oid + 217.0), h3 = hash11(oid + 241.0), h5 = hash11(oid + 301.0);
+// hO = (h1, h2, h3, h5) of this ribbon, again computed once in main().
+vec3 outerPath(vec4 hO, float oid, float s, float tm, float far) {
+  float h1 = hO.x, h2 = hO.y, h3 = hO.z, h5 = hO.w;
   float R = mix(mix(5.0, 7.0, h1), mix(10.0, 14.0, h1), far);
   float tilt = mix(-0.6, 0.7, h2);
   float roll = h3 * 6.2831853;
@@ -127,7 +130,7 @@ void main() {
     vec3 up = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
     vec3 center = CORE + vec3(0.0, EYE, 0.0);
     vHalo = 1.0;
-    vUv = vec2(aT, aSide);
+    vUv = vec2(aT, aSide) * 0.8;                  // 0.8 = sqrt(0.64): the fragment edge ramp reaches 0 at the quad border
     gl_Position = projectionMatrix * viewMatrix * vec4(center + (right * aT + up * aSide) * HALO_SIZE, 1.0);
     return;
   }
@@ -141,8 +144,10 @@ void main() {
   float h1 = hash11(id + 1.0), h2 = hash11(id + 17.0), h3 = hash11(id + 41.0), h4 = hash11(id + 73.0), h5 = hash11(id + 101.0), h6 = hash11(id + 131.0);
   float sgn = h5 > 0.5 ? 1.0 : -1.0;
 
+  vec4 hO = outerLayer < 0.5 ? vec4(0.0) : vec4(hash11(oid + 201.0), hash11(oid + 217.0), hash11(oid + 241.0), hash11(oid + 301.0));
+
   // linear speed 0.5..1.2 m/s (outer ones 0.3..0.6, far ones 0.4..0.8) => angular speed = v / mean radius
-  float Rout = mix(mix(5.0, 7.0, hash11(oid + 201.0)), mix(10.0, 14.0, hash11(oid + 201.0)), farLayer);
+  float Rout = mix(mix(5.0, 7.0, hO.x), mix(10.0, 14.0, hO.x), farLayer);
   float R0 = outerLayer < 0.5 ? 0.5 * (mix(1.4, 4.0, h1) + mix(1.4, 4.0, h2)) : Rout;
   float v = outerLayer < 0.5 ? mix(0.5, 1.2, h4) : mix(mix(0.3, 0.6, h4), mix(0.4, 0.8, h4), farLayer);
   float omega = sgn * v / R0;
@@ -151,11 +156,12 @@ void main() {
 
   vec3 P, P2;
   if (outerLayer < 0.5) {
-    P = mainPath(id, th, uTime);
-    P2 = mainPath(id, th + 0.02, uTime);
+    vec3 hA = vec3(h1, h2, h3), hB = vec3(h4, h5, h6);
+    P = mainPath(hA, hB, id, th, uTime);
+    P2 = mainPath(hA, hB, id, th + 0.02, uTime);
   } else {
-    P = outerPath(oid, th, uTime, farLayer);
-    P2 = outerPath(oid, th + 0.02, uTime, farLayer);
+    P = outerPath(hO, oid, th, uTime, farLayer);
+    P2 = outerPath(hO, oid, th + 0.02, uTime, farLayer);
   }
   vec3 world = P + vec3(0.0, EYE, 0.0);
   vec3 tang = normalize(P2 - P);
@@ -207,8 +213,9 @@ void main() {
 `;
 
 const RIBBON_FRAG = /* glsl */ `
+precision mediump float;
 uniform vec3 uHaloA, uHaloB, uAccent;
-uniform float uOpacity, uBright, uBass, uBeat;
+uniform highp float uOpacity, uBright, uBass, uBeat; // uBright / uBeat are shared with the vertex stage: keep highp so the link precision matches
 varying float vSide;
 varying float vAlpha;
 varying float vHead;
@@ -216,14 +223,16 @@ varying float vWide;
 varying float vHalo;
 varying vec2 vUv;
 varying vec3 vColor;
+${OUTPUT_GLSL}
 
 void main() {
   vec3 col;
   float a;
   if (vHalo > 0.5) {
-    // soft additive sun glow behind the core
+    // soft additive sun glow behind the core; the squared ramp takes it to exactly 0 at the quad border
     float d2 = dot(vUv, vUv);
-    a = exp(-d2 * 3.5) * max(0.0, 1.0 - d2) * (${HALO_BASE.toFixed(2)} + 0.08 * uBass + 0.3 * uBeat) * uBright;
+    float ramp = max(0.0, 1.0 - d2 / 0.64);
+    a = exp(-d2 * 3.5) * ramp * ramp * (${HALO_BASE.toFixed(2)} + 0.08 * uBass + 0.3 * uBeat) * uBright;
     col = mix(uHaloA, uHaloB, smoothstep(0.0, 0.6, d2));
   } else {
     float s2 = vSide * vSide;
@@ -233,11 +242,9 @@ void main() {
     // hot spots lean on the palette accent (never pure white), so ribbon heads read as saturated glints
     col = mix(vColor, mix(uAccent, vec3(1.0), 0.2), clamp(core * 0.2 * (1.0 - vWide) + vHead * 0.35, 0.0, 1.0));
   }
-  // soft shoulder instead of a hard clip: the brightest pixels (ribbon heads) roll off smoothly before tone mapping
+  // soft shoulder instead of a hard clip: the brightest pixels (ribbon heads) roll off smoothly before the output curve
   vec3 c = vec3(1.0) - exp(-col * a);
-  gl_FragColor = vec4(c * uOpacity, 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  gl_FragColor = vec4(cheapOutputAdditive(c * uOpacity), 1.0);
 }
 `;
 
@@ -273,6 +280,7 @@ void main() {
 
 const CORE_FRAG = /* glsl */ `
 ${NOISE_GLSL}
+${OUTPUT_GLSL}
 uniform sampler2D uGradient;
 uniform vec3 uPrimary, uSecondary, uAccent;
 uniform float uTime, uBass, uBeat, uBright, uOpacity;
@@ -284,7 +292,8 @@ void main() {
   vec3 N = normalize(vNormalW);
   vec3 V = normalize(cameraPosition - vWorld);
   float mu = abs(dot(N, V));
-  float fres = pow(1.0 - mu, 2.4);
+  float rim = clamp(1.0 - mu, 0.0, 1.0);                        // base clamped: 1 - |dot| can dip below 0 after normalisation (pow -> NaN)
+  float fres = rim * rim * sqrt(rim);                           // ~ rim^2.5 without pow
   float rd = sqrt(max(0.0, 1.0 - mu * mu));                       // 0 at the disc centre .. 1 at the limb
   // soft two-octave turbulence of the surface (replaces the old contour lines)
   vec3 q = N * 2.0 + vec3(0.0, uTime * 0.07, uTime * 0.05);
@@ -299,9 +308,7 @@ void main() {
   col = mix(col, uAccent, clamp(fres * 0.35, 0.0, 1.0));
   float pulse = 0.5 + 0.8 * uBass + 0.3 * uBeat;
   float a = 0.1 * (0.22 + 0.55 * turb + 0.9 * hot + 1.6 * fres) * pulse * mix(1.0, ${REFLECTION.toFixed(1)}, vMirror);
-  gl_FragColor = vec4(col * (a * uBright * uOpacity), 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  gl_FragColor = vec4(cheapOutputAdditive(col * (a * uBright * uOpacity)), 1.0);
 }
 `;
 

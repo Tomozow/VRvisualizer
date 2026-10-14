@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { AudioFeatures } from '@/audio/types';
 import type { Preset, PresetContext, QualityLevel, VizParams } from '@/viz/types';
 import { HISTORY_GLSL } from '@/viz/shared/AudioTextures';
+import { OUTPUT_GLSL } from '@/viz/shared/Shading';
 
 const TAU = Math.PI * 2;
 const EYE = 1.6;
@@ -17,8 +18,10 @@ const TWIST_BASE = 0.008;
 const TWIST_MID = 0.008;
 const TWIST_TAU = 1.2;
 const PULSE_SECONDS = 0.8;
+/** The half of the tube behind the listener is only drawn when the head turns away from -Z far enough to see it. */
+const BACK_VISIBLE_Z = -0.35;
 /** Longitudinal lines around the circumference (independent of the mesh density). */
-const SEG_LINES = 64;
+const SEG_LINES = 48;
 /** `rings` = rows per side of the listener's plane; the tube has 2 * (rings - 1) + 1 rows. */
 const QUALITY: Record<QualityLevel, { rings: number; segs: number }> = {
   low: { rings: 64, segs: 96 },
@@ -26,9 +29,9 @@ const QUALITY: Record<QualityLevel, { rings: number; segs: number }> = {
   high: { rings: 128, segs: 192 },
 };
 
-// Shared vertex stage for the lines pass and the dark volume pass: places row s of the single tube that runs from
-// -L (in front) to +L (behind) through the listener's plane, deforms its radius with the waveform / spectrum of the
-// row's age and hands the fragment stage grid coordinates.
+// Vertex stage: places row s of the single tube that runs from -L (in front) to +L (behind) through the listener's
+// plane, deforms its radius with the waveform / spectrum of the row's age and hands the fragment stage grid coordinates.
+// Audio comes from the pre-blurred history textures, 3 taps each (instead of 24 + 24 raw fetches per vertex).
 const vert = (rings: number, segs: number) => /* glsl */ `
 ${HISTORY_GLSL}
 #define RINGS ${rings}.0
@@ -56,31 +59,20 @@ varying float vDisp;
 varying float vPulse;
 varying vec3 vColor;
 
-// Raw waveform frames decorrelate quickly (no trigger alignment) and carry far more detail than the tube can
-// show, so low-pass it. The taps are spaced exactly 2 texels apart (one bilinear tap covers 2), so the box is gap-free
-// and nothing aliases into zig-zags: 12 taps (~0.09 of the circle, triangular) x 2 frames.
-float waveSmooth(float u, float age) {
-  float s = 0.0, ws = 0.0;
-  for (int i = 0; i < 12; i++) {
-    float k = float(i) - 5.5;
-    float wi = 6.5 - abs(k);
-    float uu = clamp(u + k * 0.0078125, 0.01, 0.99);
-    s += wi * (histWave(uu, age) + histWave(uu, age + 4.0));
-    ws += 2.0 * wi;
-  }
-  return s / ws;
+// The smooth textures already hold a 12-sample (waveform) / 5-band (spectrum) box blur and ~3 rows of temporal averaging.
+// Three taps one box-width apart (and +-4 frames apart in time) with 1-2-1 weights tile that gap-free into a rounded
+// profile, so nothing aliases into zig-zags and the polyline has no kinks.
+float waveSm(float u, float age) {
+  float a = histWaveSmooth(clamp(u - 0.047, 0.01, 0.99), age + 4.0);
+  float b = histWaveSmooth(clamp(u, 0.01, 0.99), age);
+  float c = histWaveSmooth(clamp(u + 0.047, 0.01, 0.99), max(age - 4.0, 0.0));
+  return 0.25 * (a + c) + 0.5 * b;
 }
-// Same idea for the spectrum: 8 taps x 2 bands = 16 bands, +-4 frames, so single hot bands become rounded bulges.
-float specSmooth(float b, float age) {
-  float s = 0.0, ws = 0.0;
-  for (int i = 0; i < 8; i++) {
-    float k = float(i) - 3.5;
-    float wi = 4.5 - abs(k);
-    float bb = clamp(b + k * 0.015625, 0.01, 0.99);
-    s += wi * (histFreq(bb, max(age - 4.0, 0.0)) + histFreq(bb, age) + histFreq(bb, age + 4.0));
-    ws += 3.0 * wi;
-  }
-  return s / ws;
+float specSm(float band, float age) {
+  float a = histFreqSmooth(clamp(band - 0.039, 0.01, 0.99), age + 4.0);
+  float b = histFreqSmooth(clamp(band, 0.01, 0.99), age);
+  float c = histFreqSmooth(clamp(band + 0.039, 0.01, 0.99), max(age - 4.0, 0.0));
+  return 0.25 * (a + c) + 0.5 * b;
 }
 
 void main() {
@@ -95,12 +87,12 @@ void main() {
   // waveform of this row's age, mirrored around the tube so the seam closes; the cosine remap of u gives the profile
   // zero slope on both side walls, so the mirror axis is a smooth bulge instead of a kink
   float u = abs(aSeg * 2.0 - 1.0);
-  float w = waveSmooth(0.5 - 0.5 * cos(u * 3.14159265), age);
+  float w = waveSm(0.5 - 0.5 * cos(u * 3.14159265), age);
   // spectrum (lower 60 %) of the same age wrapped around the tube: bass at the sides, highs top and bottom (smooth: sin^2)
   float sn = sin(aSeg * 6.2831853);
   float band = 0.03 + 0.57 * sn * sn;
-  float sp = specSmooth(band, age);
-  float bass = histFreq(0.08, age);
+  float sp = specSm(band, age);
+  float bass = histFreqSmooth(0.08, age);
 
   float dp = (jn - uBeatPos) / 0.025;
   float pulse = uBeatAmp * exp(-dp * dp);
@@ -124,8 +116,11 @@ void main() {
   vDisp = abs(disp);
   vPulse = pulse;
   // near = top of the gradient (capped below white), far = primary; bass lifts a row up the gradient
-  float gc = clamp(mix(0.88, 0.3, pow(jn, 0.6)) - 0.12 * back + 0.14 * bass, 0.0, 0.8);
-  vColor = texture2D(uGradient, vec2(gc, 0.5)).rgb;
+  float gc = clamp(mix(0.88, 0.3, pow(max(jn, 0.0), 0.6)) - 0.12 * back + 0.14 * bass, 0.0, 0.8);
+  vec3 gcol = texture2D(uGradient, vec2(gc, 0.5)).rgb;
+  // palettes differ a lot in luminance (greens / cyans read ~2x brighter than reds / violets at the same value): partly even that out
+  float lum = dot(gcol, vec3(0.2126, 0.7152, 0.0722));
+  vColor = gcol * mix(1.0, clamp(0.45 / max(lum, 0.05), 0.55, 2.0), 0.6);
   gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
 }
 `;
@@ -133,6 +128,7 @@ void main() {
 // Glowing wireframe: ring lines + longitudinal lines drawn analytically with fwidth (constant pixel width), on a
 // nearly black translucent volume. One premultiplied pass (dst * (1 - a) + rgb): the volume darkens what is behind the
 // tube (stars, floor, aurora) so the space between the lines stays empty, and the lines are added on top.
+// Stays highp: the grid is computed from fract() of ring / segment coordinates.
 const TUBE_FRAG = /* glsl */ `
 uniform vec3 uAccent, uBg;
 uniform float uOpacity, uBright;
@@ -145,58 +141,75 @@ varying float vBass;
 varying float vDisp;
 varying float vPulse;
 varying vec3 vColor;
+${OUTPUT_GLSL}
 
-// thin anti-aliased line (half width hw px, edge softness px) at every integer of x plus a tight halo and a second,
-// wider soft band (~2.5 px, 0.25) so lines are not hard hairlines on black; everything fades out once lines get
-// denser than ~3-5 px (moire)
+// thin anti-aliased line (half width hw px, edge softness px) at every integer of x, a soft ~2.5 px band around it (0.25)
+// and a short tail so lines are not hard hairlines on black; everything fades out once lines get denser than ~3-5 px
+// (moire)
 float gridLine(float x, float hw, float soft, float glowAmt) {
   float fw = max(fwidth(x), 1e-5);
   float d = abs(fract(x + 0.5) - 0.5) / fw;
   float line = 1.0 - smoothstep(hw, hw + soft, d);
-  float glow = exp(-d * 0.6) * glowAmt + 0.25 * exp(-d * d * 0.16);
-  return (line + glow) * (1.0 - smoothstep(0.18, 0.40, fw));
+  float band = 0.25 * (1.0 - smoothstep(0.0, 2.5, d));
+  float tail = exp(-d * 0.7) * glowAmt;
+  // lines crowding together (small spacing, large fw) dim first so the converging far field stays a calm glow, then the moire fade removes them
+  float crowd = 1.0 - 0.7 * smoothstep(0.02, 0.16, fw);
+  return (line + band + tail) * crowd * (1.0 - smoothstep(0.18, 0.40, fw));
 }
 
 void main() {
-  // hairlines near the user, more body (up to a 0.9 px half width) further down the tunnel
-  float hw = mix(0.25, 0.9, vRamp);
+  // fine lines near the user, more body (up to a 0.9 px half width) further down the tunnel
+  float hw = mix(0.55, 0.9, vRamp);
   float soft = mix(0.6, 1.0, vRamp);
-  float glowAmt = mix(0.06, 0.2, vRamp);
+  float glowAmt = mix(0.04, 0.12, vRamp);
   float ringL = gridLine(vK, hw, soft, glowAmt);
   float segL = gridLine(vSeg, hw * 0.85, soft, glowAmt);
-  float lines = max(ringL, 0.7 * segL);
-  // quiet base, bass rings stand out (squared so the contrast is kept while the average comes down)
-  float energy = 0.08 + 0.55 * vBass * vBass + 0.2 * vDisp;
-  // the surface itself glows faintly (stronger at bass rings) so the lines sit in light, not on black
-  vec3 col = vColor * (lines * energy + 0.03 * (0.4 + vBass));
+  float lines = max(ringL, 0.45 * segL);
+  // quiet base, bass rings stand out (squared so the contrast is kept while the average comes down); about 45 % dimmer
+  // than the first version, which read as a uniformly bright full-field grid
+  float energy = 0.02 + 0.25 * vBass * vBass + 0.07 * vDisp;
+  // the dark surface is lit at bass rings so the lines sit in light, not on black
+  // only the strongest bass rows light the surface, and only faintly: the space between lines must stay near black
+  float ring = smoothstep(0.72, 0.96, vBass);
+  vec3 col = vColor * (lines * energy + 0.018 * (0.4 + vBass) * ring * ring);
   // beat pulse ring travelling away from the user stays the bright accent
-  col += mix(vColor, uAccent, 0.5) * vPulse * (0.04 + 0.32 * lines);
-  col = min(col * (vFade * uBright), vec3(0.9));   // never let a line reach full white before tone mapping
-  float volume = 0.55 * vEnd * uOpacity;
-  gl_FragColor = vec4(col * uOpacity + uBg * (0.15 * volume), volume);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  col += mix(vColor, uAccent, 0.5) * vPulse * (0.03 + 0.24 * lines);
+  col = min(col * (vFade * uBright), vec3(0.9));   // never let a line reach full white before the output curve
+  float volume = 0.7 * vEnd * uOpacity;
+  gl_FragColor = vec4(cheapOutput(col * uOpacity + uBg * (0.15 * volume)), volume);
 }
 `;
 
-/** One continuous tube of waveform rings through the listener's plane (-L .. +L), a single draw call. */
+/**
+ * One continuous tube of waveform rings through the listener's plane (-L .. +L). The front half (in front of the user)
+ * and the back half (behind) are two draws of one material; the back half is skipped while the head looks forward.
+ */
 export class WaveTunnel implements Preset {
   readonly id = 'tunnel';
   readonly name = 'Wave Tunnel';
   readonly description = 'Fly through the waveform itself';
   readonly group = new THREE.Group();
 
-  private geometry!: THREE.BufferGeometry;
+  private frontGeo!: THREE.BufferGeometry;
+  private backGeo!: THREE.BufferGeometry;
+  private back!: THREE.Mesh;
   private material!: THREE.ShaderMaterial;
   private uniforms!: Record<string, THREE.IUniform>;
+  private renderer!: THREE.WebGLRenderer;
+  private camera!: THREE.PerspectiveCamera;
+  private readonly forward = new THREE.Vector3();
   private scroll = 0;
   private twist = TWIST_BASE;
   private rot = 0;
   private beatAge = 99;
 
   init(ctx: PresetContext): void {
+    this.renderer = ctx.renderer;
+    this.camera = ctx.camera;
     const { rings, segs } = QUALITY[ctx.quality];
-    this.geometry = buildTubeGeometry(rings, segs);
+    const geos = buildTubeGeometry(rings, segs);
+    this.frontGeo = geos.front;
+    this.backGeo = geos.back;
 
     this.uniforms = {
       ...ctx.textures.uniforms,
@@ -213,6 +226,8 @@ export class WaveTunnel implements Preset {
       uBright: { value: 0.92 },
       uOpacity: { value: 1 },
     };
+    // The listener sits inside the tube and only ever sees its inner wall, which is the front face of these triangles,
+    // so one side is enough (half the vertex and raster work of DoubleSide's two passes).
     this.material = new THREE.ShaderMaterial({
       uniforms: this.uniforms,
       vertexShader: vert(rings, segs),
@@ -220,16 +235,22 @@ export class WaveTunnel implements Preset {
       transparent: true,
       depthWrite: false,
       depthTest: true,
-      side: THREE.DoubleSide,
+      side: THREE.FrontSide,
       blending: THREE.CustomBlending, // premultiplied: dst * (1 - a) + rgb
       blendEquation: THREE.AddEquation,
       blendSrc: THREE.OneFactor,
       blendDst: THREE.OneMinusSrcAlphaFactor,
       fog: false,
     });
-    const mesh = new THREE.Mesh(this.geometry, this.material);
-    mesh.frustumCulled = false;
-    this.group.add(mesh);
+    // Sorting uses each geometry's bounding-sphere centre (19 m away), which would draw the tube BEFORE the shared floor and stars;
+    // drawn after them, the dark volume dims them, so the space between the lines stays empty.
+    const front = new THREE.Mesh(this.frontGeo, this.material);
+    front.frustumCulled = false;
+    front.renderOrder = 1;
+    this.back = new THREE.Mesh(this.backGeo, this.material);
+    this.back.frustumCulled = false;
+    this.back.renderOrder = 1;
+    this.group.add(front, this.back);
   }
 
   update(f: AudioFeatures, dt: number, _t: number, p: VizParams): void {
@@ -241,6 +262,11 @@ export class WaveTunnel implements Preset {
     this.rot += d * p.speed * 0.015;
     if (f.beat) this.beatAge = 0;
     else this.beatAge += d;
+
+    // the back half is only worth drawing when the head has turned away from -Z (in XR the renderer's own camera holds the pose)
+    const cam = this.renderer.xr.isPresenting ? this.renderer.xr.getCamera() : this.camera;
+    cam.getWorldDirection(this.forward);
+    this.back.visible = this.forward.z > BACK_VISIBLE_Z;
 
     const s = this.uniforms;
     s.uScrollFrac.value = this.scroll;
@@ -263,14 +289,19 @@ export class WaveTunnel implements Preset {
   }
 
   dispose(): void {
-    this.geometry.dispose();
+    this.frontGeo.dispose();
+    this.backGeo.dispose();
     this.material.dispose();
     this.group.clear();
   }
 }
 
-/** Indexed tube: (2 * (rings - 1) + 1) x (`segs`+1) vertices (seam duplicated so aSeg runs 0..1), two triangles per quad. */
-function buildTubeGeometry(rings: number, segs: number): THREE.BufferGeometry {
+/**
+ * Indexed tube: (2 * (rings - 1) + 1) x (`segs`+1) vertices (seam duplicated so aSeg runs 0..1), two triangles per quad.
+ * Two geometries share the vertex attributes and the index buffer; `front` draws the rows in front of the listener's
+ * plane (aRing 0 .. 0.5) and `back` the rows behind it (0.5 .. 1). They meet exactly in the listener's plane.
+ */
+function buildTubeGeometry(rings: number, segs: number): { front: THREE.BufferGeometry; back: THREE.BufferGeometry } {
   const rows = 2 * (rings - 1) + 1;
   const cols = segs + 1;
   const count = rows * cols;
@@ -305,10 +336,21 @@ function buildTubeGeometry(rings: number, segs: number): THREE.BufferGeometry {
       index[n++] = b + 1;
     }
   }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(position, 3));
-  geo.setAttribute('aRing', new THREE.BufferAttribute(aRing, 1));
-  geo.setAttribute('aSeg', new THREE.BufferAttribute(aSeg, 1));
-  geo.setIndex(new THREE.BufferAttribute(index, 1));
-  return geo;
+  const attrs = {
+    position: new THREE.BufferAttribute(position, 3),
+    aRing: new THREE.BufferAttribute(aRing, 1),
+    aSeg: new THREE.BufferAttribute(aSeg, 1),
+  };
+  const indexAttr = new THREE.BufferAttribute(index, 1);
+  const half = (rings - 1) * segs * 6; // indices of the rows in front of the plane
+  const make = (start: number, num: number) => {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', attrs.position);
+    geo.setAttribute('aRing', attrs.aRing);
+    geo.setAttribute('aSeg', attrs.aSeg);
+    geo.setIndex(indexAttr);
+    geo.setDrawRange(start, num);
+    return geo;
+  };
+  return { front: make(0, half), back: make(half, index.length - half) };
 }

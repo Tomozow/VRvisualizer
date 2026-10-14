@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { AudioFeatures } from '@/audio/types';
 import type { Preset, PresetContext, QualityLevel, VizParams } from '@/viz/types';
 import { HISTORY_GLSL } from '@/viz/shared/AudioTextures';
+import { OUTPUT_GLSL } from '@/viz/shared/Shading';
 
 const TAU = Math.PI * 2;
 const EYE = 1.6;
@@ -10,14 +11,15 @@ const R_MAX = 12;
 /** Speed (m/s) of the shockwave that travels through the nebula after each beat. */
 const WAVE_SPEED = 9;
 const DUST_COUNT = 300;
-const COUNTS: Record<QualityLevel, number> = { low: 25_000, medium: 60_000, high: 120_000 };
+/** Fill-rate bound on Quest 2: 40k sprites of ~10-20 px keep the per-eye overdraw at about 1 (see MAX_PX in the shader). */
+const COUNTS: Record<QualityLevel, number> = { low: 20_000, medium: 40_000, high: 80_000 };
 
 // Particle classes, chosen by aSeed.w: gas (large soft sprites that build the volume), dust (small coloured
 // grains that trace the filaments) and sparks (tiny points that twinkle with the treble).
-const GAS_END = 0.55;
+const GAS_END = 0.4;
 const SPARK_START = 0.95;
 const ARM_COUNT = 6;
-const HALO_FRACTION = 0.12;
+const HALO_FRACTION = 0.08;
 
 // Particle kinds (aArm.w) layered on top of the classes.
 const KIND_ARM = 0; // arms and halo
@@ -26,10 +28,11 @@ const KIND_KNOT = 2; // the dense hero knot straight ahead
 const KIND_HERO = 3; // rare large sparks with a 4-point flare
 const HAZE_FRACTION = 0.08;
 const KNOT_FRACTION = 0.08;
-const KNOT_SIGMA = 0.9;
+const KNOT_RADIUS = 2.6; // soft-edged ball with a gently cusped core (a Gaussian core saturates to white)
 const KNOT_CENTER = new THREE.Vector3(0, 1.8 - EYE, -7); // relative to the head
 const HERO_SHARE = 0.35; // of the spark class => ~1.5 % of all particles
-const DEFAULT_SEED = 0x4e45424c;
+/** Layout used when there is no `?seed=`: picked for a balanced front view (knot centred, an arm on each side). */
+const DEFAULT_SEED = 0x340ca71c;
 
 // ---------------------------------------------------------------------------------------------
 // Init-time structure (CPU). The nebula is stateless on the GPU, but its "home" positions are laid
@@ -187,10 +190,11 @@ function buildLayout(count: number, rng: Rng): Layout {
     let omega: number;
     let hue: number;
     if (knot) {
-      // mostly fine dust and sparks with a little gas so the focal point reads as a bright, grainy cluster
+      // mostly fine dust and sparks inside a glowing gas cloud, so the focal point reads as a bright, grainy cluster
       const u = next();
-      cls = u < 0.1 ? range(0, GAS_END) : u < 0.94 ? range(GAS_END, SPARK_START) : range(SPARK_START, 1);
-      pt.set(gauss() * KNOT_SIGMA, gauss() * KNOT_SIGMA, gauss() * KNOT_SIGMA).add(KNOT_CENTER);
+      cls = u < 0.3 ? range(0, GAS_END) : u < 0.92 ? range(GAS_END, SPARK_START) : range(SPARK_START, 1);
+      pt.set(gauss(), gauss(), gauss());
+      pt.multiplyScalar((KNOT_RADIUS * Math.pow(next(), 0.4)) / Math.max(pt.length(), 1e-3)).add(KNOT_CENTER);
       const n = valueNoise(pt.x * 0.9, pt.y * 0.9, pt.z * 0.9);
       if (next() > 0.45 + 0.55 * smooth(0.25, 0.7, n)) continue; // ragged edges and voids inside the knot
       kind = KIND_KNOT;
@@ -228,7 +232,7 @@ function buildLayout(count: number, rng: Rng): Layout {
       armPoint(arm, u, pt);
       // cross-section: wide for gas, tight for the dust that traces the filament, pinching and swelling along the arm
       const pinch = 0.6 + 0.8 * valueNoise(u * 5 + ai * 7.3, ai * 3.1, 1.7);
-      const sigma = (gas ? range(0.8, 1.3) : spark ? 0.7 : range(0.25, 0.5)) * pinch;
+      const sigma = (gas ? range(0.55, 0.9) : spark ? 0.55 : range(0.25, 0.5)) * pinch;
       pt.x += gauss() * sigma;
       pt.y += gauss() * sigma * 0.8;
       pt.z += gauss() * sigma;
@@ -240,7 +244,7 @@ function buildLayout(count: number, rng: Rng): Layout {
       // nothing below the floor or on top of the head; thin out smoothly toward the floor
       if (EYE + pt.y < 0.3 || pt.length() < 2 || next() > smooth(0.3, 1.8, EYE + pt.y)) continue;
       const n = 0.65 * valueNoise(pt.x * 0.2, pt.y * 0.2, pt.z * 0.2) + 0.35 * valueNoise(pt.x * 0.47 + 7.1, pt.y * 0.47, pt.z * 0.47 + 3.7);
-      if (next() > 0.35 + 0.65 * smooth(0.3, 0.7, n)) continue; // extra clumping: voids inside the arms
+      if (next() > 0.1 + 0.9 * smooth(0.45, 0.62, n)) continue; // extra clumping: real voids between the clouds
       if (cls >= SPARK_START && next() < HERO_SHARE) kind = KIND_HERO;
     }
     home[i * 3] = pt.x;
@@ -287,10 +291,9 @@ ${NOISE_GLSL}
 #define R_RANGE ${(R_MAX - R_MIN).toFixed(1)}
 #define GAS_END ${GAS_END.toFixed(2)}
 #define SPARK_START ${SPARK_START.toFixed(2)}
-#define GAS_GAIN 0.24
-#define DUST_GAIN 0.2
-#define GAS_MAX_PX 40.0
-#define SPRITE_MAX_PX 56.0
+#define DUST_GAIN 0.14
+// no sprite is ever rasterised larger than this (fill-rate cap for Quest 2)
+#define MAX_PX 32.0
 // position = home offset from the head. aSeed = (band, phase, size, class), aArm = (drift rad/s, arm hue, random, kind)
 // kind: 0 arm / halo, 1 floor haze, 2 hero knot, 3 hero spark
 attribute vec4 aSeed;
@@ -349,7 +352,7 @@ void main() {
 
   // drifting light clumps (value noise) carve the gas into billows
   float n = vnoise(p * 0.3 + vec3(0.0, T * 0.03, T * 0.02));
-  float clump = 0.35 + 0.9 * smoothstep(0.2, 0.8, n);
+  float clump = 0.5 + 0.6 * smoothstep(0.2, 0.8, n);
 
   // soft floor (smooth max of world height) and a hard 1.8 m clearance around the head
   float wy = p.y + EYE;
@@ -366,74 +369,87 @@ void main() {
   float gc = clamp(0.25 + 0.7 * hueMix + 0.08 * e + 0.08 * wave, 0.0, 1.0);
   vec3 gcol = texture2D(uGradient, vec2(gc, 0.5)).rgb;
   vColor = gcol * mix(0.45, 1.0, gc) / max(max(gcol.r, max(gcol.g, gcol.b)), 0.55);
+  // greens / cyans carry ~2x the luminance of reds / violets: partly even that out so every palette lands in the same brightness range
+  float lum = dot(gcol, vec3(0.2126, 0.7152, 0.0722));
+  vColor *= clamp(0.42 / max(lum, 0.05), 0.45, 1.6);
 
-  // treble sparkle
-  float flick = pow(max(0.0, sin(uTime * (7.0 + 13.0 * rA) + ph * 9.0)), 8.0);
-  float sp = flick * (0.15 + 1.5 * uTreble * uIntensity);
+  // treble sparkle (sin^8 by multiplication)
+  float fl = max(0.0, sin(uTime * (7.0 + 13.0 * rA) + ph * 9.0));
+  float fl2 = fl * fl, fl4 = fl2 * fl2;
+  float sp = fl4 * fl4 * (0.15 + 1.5 * uTreble * uIntensity);
 
-  // sizes (sprite = diameter): gas 0.25-0.9 m, floor haze 0.5-1.2 m, dust 0.03-0.08 m, sparks 0.02-0.045 m (small ones get a 3x glow sprite),
+  // sizes (sprite = diameter): gas 0.2-0.45 m, floor haze 0.35-0.7 m, dust 0.03-0.08 m, sparks 0.02-0.045 m (small ones get a 3x glow sprite),
   // hero sparks 0.06-0.1 m
-  float sz = gas * (0.25 + 0.65 * aSeed.z) + dust * (0.03 + 0.05 * aSeed.z) + spark * (0.02 + 0.025 * aSeed.z);
-  sz = mix(sz, 0.5 + 0.7 * aSeed.z, haze);
+  float sz = gas * (0.2 + 0.25 * aSeed.z) + dust * (0.03 + 0.05 * aSeed.z) + spark * (0.02 + 0.025 * aSeed.z);
+  sz = mix(sz, 0.35 + 0.35 * aSeed.z, haze);
   sz = mix(sz, 0.06 + 0.04 * aSeed.z, hero);
   sz *= gas * (0.85 + 0.3 * fw + 0.25 * uBass) + dust * (0.75 + 0.7 * e) + spark * (1.0 + (1.2 - 0.7 * hero) * sp);
-  sz *= 1.0 + 0.4 * uBurst * (1.0 - gas) + 0.5 * wave;
+  sz *= 1.0 + 0.4 * uBurst * (1.0 - gas) + 0.25 * wave;
   sz *= 1.0 + 0.25 * min(uBass, 1.0) * knot;                // the hero knot swells with the bass
 
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
   float dist = length(mv.xyz);
   float raw = sz * mix(3.0, 1.0, gas) * uPixelRatio * 300.0 / max(-mv.z, 0.1);
-  // large soft gas sprites are the fill-rate risk on Quest 2: never rasterise more than 40 px
-  gl_PointSize = clamp(raw, 1.0, mix(SPRITE_MAX_PX, GAS_MAX_PX, gas));
+  gl_PointSize = clamp(raw, 1.0, MAX_PX);
   gl_Position = projectionMatrix * mv;
 
   // gas also fades out toward the floor so the cloud does not end in a hard edge (the haze lives there, so it only fades with distance)
-  float gasFade = mix(smoothstep(3.0, 6.5, dist) * smoothstep(0.3, 1.6, p.y + EYE), smoothstep(3.0, 6.0, dist), haze);
-  gasFade *= 1.0 - 0.6 * smoothstep(GAS_MAX_PX, 2.5 * GAS_MAX_PX, raw); // sprites that would exceed the cap fade instead of turning into dots
+  float gasFade = mix(smoothstep(2.5, 5.5, dist) * smoothstep(0.2, 1.3, p.y + EYE), smoothstep(2.5, 5.5, dist), haze);
+  gasFade *= 1.0 - 0.6 * smoothstep(MAX_PX, 2.5 * MAX_PX, raw); // sprites that would exceed the cap fade instead of turning into dots
   float near = smoothstep(1.0, 3.0, dist) * mix(1.0, gasFade, gas);
-  float aGas = (0.03 + 0.05 * rB) * (0.5 + 1.0 * e) * clump * GAS_GAIN;
-  float aHaze = 0.02 * (0.7 + 0.6 * e) * (0.6 + 0.8 * clump);
+  // gas: soft coloured clouds, peak alpha 0.05-0.09 per sprite (many overlapping sprites build the arms, the knot and the haze)
+  float aGas = (0.05 + 0.04 * rB) * (0.5 + 0.45 * e) * clump;
+  float aHaze = (0.02 + 0.016 * rB) * (0.6 + 0.5 * e) * (0.6 + 0.6 * clump);
   float aDust = (0.25 + 0.4 * rB) * (0.35 + 0.9 * e) * clump * DUST_GAIN;
   float aSpark = 0.15 + 0.9 * sp;
   float aHero = 0.35 + 0.5 * (0.5 + 0.5 * sin(uTime * (0.7 + 1.1 * rA) + ph)) + 1.2 * sp;
   float alpha = (gas * mix(aGas, aHaze, haze) + dust * aDust + spark * mix(aSpark, aHero, hero)) * fw
-              + wave * (0.12 * gas * (1.0 - 0.75 * haze) + 0.9 * (1.0 - gas)) + 0.1 * uBurst * e;
+              + wave * (0.12 * gas * (1.0 - 0.75 * haze) + 0.4 * (1.0 - gas)) + 0.06 * uBurst * e;
   alpha *= 1.0 + 0.5 * knot;                                 // hero knot: x1.5 brightness
-  // sub-pixel sprites keep their energy but lose coverage (no shimmer); big sprites spread theirs over more pixels
-  float cover = min(1.0, raw * raw) * min(1.0, 48.0 / raw);
-  vAlpha = alpha * uBright * near * cover;
+  // sub-pixel sprites keep their energy but lose coverage (no shimmer)
+  vAlpha = alpha * uBright * near * min(1.0, raw * raw);
   vHot = clamp(wave * 0.7 + uBurst * 0.2 * e, 0.0, 1.0);
   vClass = vec3(gas, spark, hero);
 }
 `;
 
 const NEBULA_FRAG = /* glsl */ `
+precision mediump float;
 uniform vec3 uAccent;
 uniform float uOpacity;
 varying vec3 vColor;
 varying float vAlpha;
 varying float vHot;
-varying vec3 vClass;
+varying vec3 vClass; // x: gas, y: spark, z: hero spark
+${OUTPUT_GLSL}
 
+// one falloff per particle class (the class is constant across a sprite, so the branches are coherent)
 void main() {
   vec2 c = gl_PointCoord * 2.0 - 1.0;
   float d2 = dot(c, c);
   float edge = max(0.0, 1.0 - d2);
-  float gasShape = exp(-d2 * 3.2) * edge;                           // soft, no core
-  float dustShape = exp(-d2 * 16.0) + 0.45 * exp(-d2 * 5.0) * edge;  // coloured core + halo
-  float sparkShape = exp(-d2 * 34.0) + 0.3 * exp(-d2 * 7.0) * edge;  // tight bright point
-  // hero spark: bright core plus a 4-point flare (thin horizontal / vertical rays) that reads as a bloom cue
-  vec2 ac = abs(c);
-  float rays = exp(-ac.y * 26.0) * exp(-ac.x * 3.2) * (1.0 - smoothstep(0.55, 1.0, ac.x))
-             + exp(-ac.x * 26.0) * exp(-ac.y * 3.2) * (1.0 - smoothstep(0.55, 1.0, ac.y));
-  float heroShape = exp(-d2 * 60.0) + 0.25 * exp(-d2 * 9.0) * edge + 0.9 * rays;
-  float a = mix(mix(dustShape, mix(sparkShape, heroShape, vClass.z), vClass.y), gasShape, vClass.x);
-  // small sparks are near white, hero sparks lean on the palette accent; beats push the palette colour brighter
-  vec3 sparkCol = mix(uAccent, vec3(1.0), 0.35 + 0.5 * (1.0 - vClass.z));
-  vec3 col = mix(vColor * (1.0 + 0.6 * vHot), sparkCol, vClass.y * 0.85);
-  gl_FragColor = vec4(col * (a * vAlpha * uOpacity), 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  float e2 = edge * edge;
+  vec3 col = vColor * (1.0 + 0.6 * vHot);                  // beats push the palette colour brighter
+  float a;
+  if (vClass.x > 0.5) {
+    a = exp(-d2 * 3.2) * edge;                              // gas: soft, no core
+  } else if (vClass.y < 0.5) {
+    a = exp(-d2 * 14.0) + 0.35 * e2 * edge;                 // dust: coloured core + short halo
+  } else {
+    // small sparks are near white, hero sparks lean on the palette accent
+    col = mix(col, mix(uAccent, vec3(1.0), 0.35 + 0.5 * (1.0 - vClass.z)), 0.85);
+    if (vClass.z < 0.5) {
+      a = exp(-d2 * 34.0) + 0.3 * e2 * e2 * edge;           // tight bright point
+    } else {
+      // bright core plus a 4-point flare (thin horizontal / vertical rays, polynomial falloff) that reads as a bloom cue
+      vec2 ac = abs(c);
+      vec2 thin = max(vec2(0.0), 1.0 - ac.yx * 5.5);
+      thin *= thin; thin *= thin;
+      vec2 len = 1.0 - ac;
+      a = exp(-d2 * 60.0) + 0.25 * e2 * e2 + 0.9 * dot(thin, len * len);
+    }
+  }
+  gl_FragColor = vec4(cheapOutputAdditive(col * (a * vAlpha * uOpacity)), 1.0);
 }
 `;
 
@@ -460,7 +476,7 @@ void main() {
   float u2 = aSeed.z * aSeed.z, u4 = u2 * u2;
   float sz = 0.008 + 0.042 * u4 * u4;
   float raw = sz * 2.6 * uPixelRatio * 300.0 / max(-mv.z, 0.1);
-  gl_PointSize = clamp(raw, 1.0, 48.0);
+  gl_PointSize = clamp(raw, 1.0, 32.0);
   gl_Position = projectionMatrix * mv;
   float near = smoothstep(0.9, 1.6, dist);                   // nothing closer than ~1 m
   float alpha = (0.08 + 0.25 * e * uIntensity + 0.08 * uBeat) * tw * near * uBright * min(1.0, raw * raw);
@@ -469,17 +485,17 @@ void main() {
 `;
 
 const DUST_FRAG = /* glsl */ `
+precision mediump float;
 uniform vec3 uColor;
 uniform float uOpacity;
 varying float vAlpha;
+${OUTPUT_GLSL}
 
 void main() {
   vec2 c = gl_PointCoord * 2.0 - 1.0;
   float d2 = dot(c, c);
   float a = exp(-d2 * 5.0) * max(0.0, 1.0 - d2);
-  gl_FragColor = vec4(uColor * (a * vAlpha * uOpacity), 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  gl_FragColor = vec4(cheapOutputAdditive(uColor * (a * vAlpha * uOpacity)), 1.0);
 }
 `;
 
@@ -530,7 +546,7 @@ export class NebulaParticles implements Preset {
       uBurst: { value: 0 },
       uTreble: { value: 0 },
       uIntensity: { value: 1 },
-      uBright: { value: 0.92 },
+      uBright: { value: 0.78 },
       uPixelRatio: { value: pr },
       uWaveR: { value: -10 },
       uWaveAmp: { value: 0 },
@@ -618,7 +634,7 @@ export class NebulaParticles implements Preset {
     nu.uBurst.value = f.beatEnv * p.intensity;
     nu.uTreble.value = Math.min(1.2, f.treble);
     nu.uIntensity.value = p.intensity;
-    nu.uBright.value = bright;
+    nu.uBright.value = bright * 0.58; // the cloud layers overlap a lot, so they get a lower master gain than the motes
     nu.uPixelRatio.value = pr;
     nu.uWaveR.value = R_MIN - 0.6 + this.beatAge * WAVE_SPEED;
     nu.uWaveAmp.value = Math.exp(-this.beatAge * 1.7) * (0.5 + 0.5 * f.beatStrength) * Math.min(1, p.intensity);
