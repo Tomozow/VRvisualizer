@@ -89,10 +89,10 @@ float displace(vec3 n) {
   float t = uTime;
   float lobes = snoise(n * 1.25 + vec3(0.0, t * 0.16, t * 0.10));
   float body = snoise(n * 2.6 + vec3(t * 0.28, -t * 0.20, 3.7));
-  float ripple = snoise(n * 8.5 + vec3(0.0, t * 1.5, t * 1.1));
+  float ripple = snoise(n * 7.0 + vec3(0.0, t * 1.5, t * 1.1));
   float spike = pow(max(snoise(n * 3.2 + vec3(t * 0.5)), 0.0), 2.0);
-  float d = lobes * (0.07 + 0.30 * uBass) + body * (0.03 + 0.08 * uMid)
-          + ripple * (0.006 + 0.04 * uTreble) + spike * uBeat * 0.22;
+  float d = lobes * (0.07 + 0.26 * uBass) + body * (0.015 + 0.04 * uMid)
+          + ripple * (0.003 + 0.02 * uTreble) + spike * uBeat * 0.11;
   return clamp(d, -0.45, 0.55); // keeps the surface > 1 m from the listener
 }
 
@@ -145,22 +145,25 @@ void main() {
   float ndv = clamp(dot(normalize(mix(Nb, N, 0.75)), V), 0.0, 1.0);
   vec3 L = normalize(vec3(0.4, 0.7, 0.6));
 
-  // A dark sphere of energy: near-black body, emissive ridges, glowing veins, bright rim.
+  // A dark sphere of energy: the body stays dark (gradient 0.1..0.75 only, luminance capped);
+  // only the veins and the Fresnel rim are bright.
   float dn = clamp(vDisp * 1.6 + 0.5, 0.0, 1.0);
-  vec3 col = uBackground * 1.6 * (0.5 + 0.5 * max(dot(N, L), 0.0));
-  vec3 grad = texture2D(uGradient, vec2(clamp(0.1 + 0.8 * dn, 0.0, 1.0), 0.5)).rgb;
-  col += grad * (0.4 + 0.7 * uBass) * (0.15 + 0.85 * pow(dn, 1.5));
+  vec3 grad = texture2D(uGradient, vec2(0.1 + 0.65 * dn, 0.5)).rgb;
+  vec3 body = uBackground * 1.6 * (0.5 + 0.5 * max(dot(N, L), 0.0));
+  body += grad * (0.3 + 0.45 * uBass) * (0.1 + 0.9 * pow(dn, 1.8));
+  float lum = dot(body, vec3(0.2126, 0.7152, 0.0722));
+  vec3 col = body * min(1.0, 0.28 / max(lum, 1e-4));
 
-  // veins: ridged noise, thin bright lines that crawl over the surface
+  // veins: ridged noise, thin bright lines that crawl over the surface (<= 1.2)
   float vn = snoise(vDir * 2.7 + vec3(0.0, uTime * 0.12, uTime * 0.07));
   float vein = pow(1.0 - abs(vn), 9.0);
-  vec3 veinCol = texture2D(uGradient, vec2(clamp(0.6 + 0.4 * dn, 0.0, 1.0), 0.5)).rgb;
-  col += veinCol * vein * (0.5 + 1.1 * uBass + 0.8 * uBeat);
+  vec3 veinCol = texture2D(uGradient, vec2(0.45 + 0.3 * dn, 0.5)).rgb;
+  col += veinCol * vein * min(0.5 + 1.1 * uBass + 0.8 * uBeat, 1.2);
 
-  // Fresnel rim and a small specular highlight
-  col += mix(uAccent, uPrimary, 0.45) * pow(1.0 - ndv, 3.4) * 2.2;
+  // Fresnel rim (<= 1.6) and a small specular highlight
+  col += mix(uAccent, uPrimary, 0.45) * pow(1.0 - ndv, 4.5) * 1.6;
   vec3 H = normalize(L + V);
-  col += mix(uAccent, uPrimary, 0.3) * pow(max(dot(N, H), 0.0), 32.0) * 0.5;
+  col += mix(uAccent, uPrimary, 0.3) * pow(max(dot(N, H), 0.0), 32.0) * 0.4;
 
   gl_FragColor = vec4(col * uBrightness, uOpacity);
   #include <tonemapping_fragment>
@@ -176,8 +179,11 @@ varying vec2 vUv;
 void main() {
   vUv = position.xy * 2.0;
   vec4 mv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
-  mv.z -= 0.8; // sits just behind the core
-  mv.xy += position.xy * uSize;
+  // push the quad 1.4 m further away along the view ray: behind the whole displaced core, so depth testing
+  // keeps it off the core's surface while its projected centre and angular size stay unchanged
+  float k = (length(mv.xyz) + 1.4) / length(mv.xyz);
+  mv.xyz *= k;
+  mv.xy += position.xy * uSize * k;
   gl_Position = projectionMatrix * mv;
 }`;
 
@@ -276,7 +282,7 @@ void main() {
   // thin (~8 cm) bright ring at the leading edge + a faint wake
   float ed = (d - 0.05) / 0.035;
   float ring = exp(-ed * ed);
-  float wake = smoothstep(0.0, 0.06, d) * exp(-d * 2.2) * 0.12;
+  float wake = smoothstep(0.0, 0.06, d) * exp(-d * 4.0) * 0.06;
   float life = pow(clamp(1.0 - vAge, 0.0, 1.0), 1.3);
   vec3 col = uAccent * (ring * 2.6 + wake);
   col *= life * vPower * uBrightness * uOpacity * smoothstep(0.8, 2.0, distance(vWorld, cameraPosition));

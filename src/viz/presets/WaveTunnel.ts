@@ -41,7 +41,9 @@ uniform float uGradShift;
 uniform float uIntensity, uLevel, uBeatPos, uBeatAmp;
 varying float vK;
 varying float vSeg;
-varying float vFade;
+varying float vFade; // brightness envelope along the tunnel: dim near the user, strongest mid-way, dissolving far away
+varying float vEnd;  // only the far-end dissolve (used by the dark volume)
+varying float vRamp; // 0 at the user .. 1 from ~9 m on: lines get thicker with distance
 varying float vBass;
 varying float vDisp;
 varying float vPulse;
@@ -101,8 +103,10 @@ void main() {
   float th = aSeg * 6.2831853 + uRot + uPhase + j * uTwist;
   vec3 p = vec3(cos(th) * r, EYE + sin(th) * r, -(FIRST + j * SPACING) * uFlip);
 
-  // near-end and far-end dissolve so rings never pop in or out
-  vFade = (0.3 + 0.7 * smoothstep(0.0, 8.0, j)) * (1.0 - smoothstep(0.6 * RINGS, 1.0 * RINGS, j));
+  // near rings are dim and thin, mid/far rings carry the glow; the far end dissolves so rings never pop in or out
+  vRamp = smoothstep(0.0, 22.0, j);
+  vEnd = 1.0 - smoothstep(0.6 * RINGS, 1.0 * RINGS, j);
+  vFade = (0.15 + 0.85 * vRamp) * vEnd;
   vK = k;
   vSeg = aSeg * SEGS;
   vBass = bass;
@@ -121,27 +125,34 @@ uniform float uOpacity, uBright, uGain;
 varying float vK;
 varying float vSeg;
 varying float vFade;
+varying float vRamp;
 varying float vBass;
 varying float vDisp;
 varying float vPulse;
 varying vec3 vColor;
 
-// thin anti-aliased line (half width hw px) at every integer of x plus a soft halo; fades out once lines get denser than ~2 px
-float gridLine(float x, float hw) {
+// thin anti-aliased line (half width hw px, edge softness px) at every integer of x plus a faint halo;
+// fades out once lines get denser than ~2 px
+float gridLine(float x, float hw, float soft, float glowAmt) {
   float fw = max(fwidth(x), 1e-5);
   float d = abs(fract(x + 0.5) - 0.5) / fw;
-  float line = 1.0 - smoothstep(hw, hw + 1.0, d);
-  float glow = exp(-d * 0.45) * 0.35;
+  float line = 1.0 - smoothstep(hw, hw + soft, d);
+  float glow = exp(-d * 0.6) * glowAmt;
   return (line + glow) * (1.0 - smoothstep(0.3, 0.55, fw));
 }
 
 void main() {
-  float ringL = gridLine(vK, 0.6);
-  float segL = gridLine(vSeg * 0.5, 0.5);
+  // hairlines near the user, a little more body further down the tunnel
+  float hw = mix(0.25, 0.55, vRamp);
+  float soft = mix(0.6, 1.0, vRamp);
+  float glowAmt = mix(0.06, 0.2, vRamp);
+  float ringL = gridLine(vK, hw, soft, glowAmt);
+  float segL = gridLine(vSeg * 0.5, hw * 0.85, soft, glowAmt);
   float lines = max(ringL, 0.7 * segL);
-  float energy = 0.35 + 1.3 * vBass + 0.6 * vDisp;
-  vec3 col = vColor * (lines * energy + 0.012 + 0.06 * vBass);
-  // beat pulse ring travelling from far to near
+  // quiet base, bass rings stand out (squared so the contrast is kept while the average comes down)
+  float energy = 0.18 + 1.7 * vBass * vBass + 0.45 * vDisp;
+  vec3 col = vColor * (lines * energy + 0.003 + 0.02 * vBass * vBass);
+  // beat pulse ring travelling from far to near stays the bright accent
   col += mix(vColor, vec3(1.0), 0.55) * vPulse * (0.25 + 1.3 * lines);
   gl_FragColor = vec4(col * (vFade * uBright * uGain * uOpacity), 1.0);
   #include <tonemapping_fragment>
@@ -149,16 +160,14 @@ void main() {
 }
 `;
 
-// Dark translucent volume behind the lines: gives the tube depth against the sky layer.
+// Dark translucent volume behind the lines: nearly black, so the space between the lines stays empty and the tube has depth.
 const DARK_FRAG = /* glsl */ `
 uniform vec3 uBg;
 uniform float uOpacity;
-varying float vFade;
-varying float vBass;
-varying vec3 vColor;
+varying float vEnd;
 
 void main() {
-  gl_FragColor = vec4(uBg * 0.4 + vColor * (0.02 + 0.05 * vBass), 0.32 * vFade * uOpacity);
+  gl_FragColor = vec4(uBg * 0.15, 0.55 * vEnd * uOpacity);
 }
 `;
 

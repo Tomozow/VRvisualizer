@@ -156,7 +156,7 @@ void main() {
   float e = histFreq(band, aT * AGE_SPAN);
   e = clamp(e * (0.7 + 0.5 * uIntensity), 0.0, 1.2);
 
-  float cap = sqrt(smoothstep(0.0, 0.015, aT));          // pointed head
+  float cap = sqrt(smoothstep(0.0, 0.05, aT));           // head width tapers to a point over the first 5 % of the trail
   float taper = 1.0 - 0.4 * aT;
   float dist = length(toCam);
   // half-width of the quad (the bright core is about half of it): 0.05..0.12 m for main ribbons, wide soft bands for outer ones
@@ -167,11 +167,13 @@ void main() {
   vec3 pos = world + side * (aSide * hw);
 
   float tailFade = (1.0 - smoothstep(0.4, 1.0, aT)) * (1.0 - 0.35 * aT);   // fades over the last 60 %
-  float headGlow = exp(-aT * 22.0);
+  // soft head: brightness rises smoothly from the tip (no cut), peaks just behind it and decays along the trail
+  float headSoft = smoothstep(0.0, 0.05, aT);
+  float headGlow = exp(-aT * 22.0) * headSoft;
   float front = -P.z / max(length(P), 0.001);                               // 1 straight ahead (-Z)
   float fbias = outerLayer < 0.5 ? 0.6 + 0.4 * smoothstep(-0.6, 0.9, front) : 1.0;
   float near = smoothstep(0.8, 2.2, dist);
-  float alpha = (0.2 + 0.9 * e + 0.2 * uBeat) * tailFade * (1.0 + 1.6 * headGlow * (1.0 - outerLayer)) * fbias * near * uBright;
+  float alpha = (0.2 + 0.9 * e + 0.2 * uBeat) * tailFade * headSoft * (1.0 + 1.0 * headGlow * (1.0 - outerLayer)) * fbias * near * uBright;
   vAlpha = alpha * mix(1.0, 0.32, outerLayer);
   vHead = headGlow * (1.0 - outerLayer);
   vSide = aSide;
@@ -206,9 +208,12 @@ void main() {
     float edge = 1.0 - s2;                  // soft edges
     float core = exp(-s2 * mix(8.0, 2.5, vWide));
     a = edge * (core + 0.28 * exp(-s2 * 2.2)) * vAlpha;
-    col = mix(vColor, vec3(1.0), clamp(core * 0.25 * (1.0 - vWide) + vHead * 0.5, 0.0, 1.0));
+    col = mix(vColor, vec3(1.0), clamp(core * 0.2 * (1.0 - vWide) + vHead * 0.35, 0.0, 1.0));
   }
-  gl_FragColor = vec4(col * (a * uOpacity), 1.0);
+  // cap the brightest pixels (ribbon heads) at ~1.3 before tone mapping so they never clip into flat white blocks
+  vec3 c = col * a;
+  c *= min(1.0, 1.3 / max(max(c.r, max(c.g, c.b)), 1e-4));
+  gl_FragColor = vec4(c * uOpacity, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }

@@ -4,11 +4,11 @@ import type { Preset, PresetContext, VizParams } from '@/viz/types';
 import { HISTORY_GLSL } from '@/viz/shared/AudioTextures';
 
 const WIDTH = 60;
-const DEPTH = 45;
-const Z_CENTER = -4; // plane spans z = -26.5 .. +18.5: deeper ahead, still covered behind
+const DEPTH = 73.5;
+const Z_CENTER = -18.25; // plane spans z = -55 .. +18.5: deep ahead (hills fade into the fog under the sun), still covered behind
 const CEILING_Y = 12;
 const FLOOR_LIFT = 0.03; // keeps the flat zone above the shared environment floor (y = 0)
-const BEAT_RING_MAX = 40; // metres
+const BEAT_RING_MAX = 50; // metres
 const BEAT_RING_SPEED = 16; // metres per second
 const SKY_RADIUS = 80; // sun / haze cylinder
 const SKY_HEIGHT = 30; // tall enough that the sun's glow is never clipped by the cylinder rim
@@ -16,9 +16,9 @@ const SUN_Y = 8.5;
 const SUN_RADIUS = 9;
 
 const SEGMENTS: Record<string, [number, number]> = {
-  low: [128, 96],
-  medium: [256, 192],
-  high: [320, 256],
+  low: [96, 144],
+  medium: [192, 288],
+  high: [256, 384],
 };
 
 /** Terrain constants shared by the shaders. Age 0 = newest spectrum row. */
@@ -58,7 +58,7 @@ varying float vMask;
 // 1 inside the plane, fading to 0 toward its borders
 float edgeMask(vec2 xz) {
   float ex = 1.0 - smoothstep(0.62, 1.0, abs(xz.x) / HALF_W);
-  float ez = smoothstep(0.0, 9.0, min(xz.y - Z_MIN, Z_MAX - xz.y));
+  float ez = smoothstep(0.0, 12.0, min(xz.y - Z_MIN, Z_MAX - xz.y));
   return ex * ez;
 }
 
@@ -69,7 +69,8 @@ float spectrum(float u, float age) {
 float terrainH(vec2 xz) {
   float f = clamp(abs(xz.y) / Z_FRONT, 0.0, 1.0); // user stands at z = 0
   float age = AGE_MAX * pow(f, 0.85);
-  float u = pow(clamp(abs(xz.x) / HALF_W, 0.0, 1.0), 0.6) * 0.94 + 0.01; // mirrored: bass in the centre, treble at the edges
+  float ax = sqrt(xz.x * xz.x + 4.0) - 2.0; // rounded |x|: no sharp crest along the centre line
+  float u = pow(clamp(ax / (HALF_W - 2.0), 0.0, 1.0), 0.6) * 0.94 + 0.01; // mirrored: bass in the centre, treble at the edges
   float du = 0.035;
   float da = 2.0 + 0.04 * age;
   float e = 0.4 * spectrum(u, age)
@@ -77,14 +78,14 @@ float terrainH(vec2 xz) {
   e = clamp(e * (0.85 + 0.6 * u), 0.0, 1.3);
 
   float r = length(xz);
-  float taper = smoothstep(2.5, 12.0, r); // flat under the feet, nothing towers over the head
+  float taper = smoothstep(2.5, 6.0, r); // flat 2.5 m around the feet, full height by 6 m
   float front = mix(0.65, 1.0, 1.0 - smoothstep(-8.0, 3.0, xz.y)); // strongest ahead (-Z)
   float mask = edgeMask(xz);
 
   // slow undulation so there is landscape even in quiet passages
   float roll = sin(xz.x * 0.16 + uTime * 0.10) * sin(xz.y * 0.12 - uTime * 0.08) * 0.65
              + sin(xz.x * 0.07 + xz.y * 0.10 + uTime * 0.06) * 0.35;
-  float h = pow(e, 1.6) * 4.0 * uIntensity * front + 0.6 + 0.6 * roll;
+  float h = pow(e, 1.6) * 5.0 * uIntensity * front + 0.9 + 0.9 * roll;
 
   // swell travelling across the ground on every beat
   float sw = (r - uBeatRing) / 1.8;
@@ -162,13 +163,13 @@ void main() {
   // Beat ring racing across the ground from the user's position.
   float r = length(vWorld.xz);
   float rd = (r - uBeatRing) / 0.3;
-  float ringI = exp(-rd * rd) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0)) * smoothstep(1.0, 4.0, uBeatRing);
+  float ringI = exp(-rd * rd) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0)) * smoothstep(2.0, 7.0, uBeatRing);
   col += mix(uAccent, gradHi, 0.5) * ringI * (0.8 + 1.5 * lines);
 
   col *= mix(1.0, 0.3, vCeil) * uBrightness * (0.85 + 0.3 * uLevel) * (1.0 + uBeat * 0.2);
 
-  // exp fog into the background beyond ~20 m, so the far hills dissolve
-  float fog = 1.0 - exp(-pow(max(dist - 20.0, 0.0) * 0.045, 2.0));
+  // fog into the background from 25 m, complete by 55 m: the far hills stay faintly visible under the sun
+  float fog = smoothstep(25.0, 55.0, dist);
   col = mix(col, uBackground, fog);
 
   gl_FragColor = vec4(col, uOpacity * pow(vMask, 0.6));
@@ -225,7 +226,7 @@ void main() {
 /**
  * A spectrogram landscape that encloses the listener: floor and (inverted) ceiling are the same displaced
  * grid drawn as one InstancedMesh, plus one sky cylinder (haze + sun). 2 draw calls.
- * Vertices (medium): 2 x 257 x 193 = ~99k for the terrain.
+ * Vertices (medium): 2 x 193 x 289 = ~112k for the terrain.
  */
 export class SpectralTerrain implements Preset {
   readonly id = 'terrain';
