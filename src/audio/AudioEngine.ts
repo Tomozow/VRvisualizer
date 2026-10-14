@@ -19,8 +19,8 @@ import { isAudioFile, metaFromUrl, parseFileName, readId3 } from './trackInfo';
 type Mode = 'element' | 'youtube' | 'demo';
 type WebkitWindow = Window & { webkitAudioContext?: typeof AudioContext };
 
-const AUTOPLAY_HINT = 'Press play in the video if it does not start (autoplay was blocked).';
-const MIC_HINT = 'Visuals cannot follow this YouTube video without the microphone (or a YouTube proxy, see Settings).';
+const AUTOPLAY_HINT = 'Tap ▶ to start. The browser blocked autoplay.';
+const MIC_HINT = 'Visuals can\'t follow YouTube without the microphone (or a proxy: Sources → Advanced).';
 const TIME_POLL = 0.1; // s between currentTime/duration refreshes
 const RESUME_RETRY_MS = 3000; // while the context is suspended but audio is wanted: how often update() retries resume()
 
@@ -717,9 +717,13 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     if (!wanted()) throw abortError();
     this.micAnalyser ??= this.makeAnalyser(ctx);
     await this.mic.open(ctx, this.micAnalyser);
-    // Not wanted any more: disableMic() already closed (and aborted) the capture it cancelled, so the stream that is
-    // open here belongs to a newer request that shares it (a YouTube track replacing another one, an explicit enable).
-    if (!wanted()) throw abortError();
+    // Not wanted any more. If disableMic() cancelled the request, MicSource has already stopped the capture (and
+    // this wasn't reached). Otherwise the track changed: the stream that is open now belongs to the newer request
+    // that shares it (a YouTube track replacing another one, an explicit enable) - or to nobody, then release it.
+    if (!wanted()) {
+      if (req === this.micReq && !this.micExplicit && this.mode !== 'youtube') this.disableMic();
+      throw abortError();
+    }
     if (!explicit) this.extractor.resetBeat();
     this.set({ micEnabled: true });
   }

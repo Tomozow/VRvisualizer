@@ -104,7 +104,7 @@ function describe(e: unknown): Error {
   switch (name) {
     case 'NotAllowedError':
     case 'SecurityError':
-      return new Error('Microphone permission was denied. Allow microphone access for this site in the browser settings, then try again.');
+      return new Error('Microphone blocked. Allow it in the browser\'s site settings, then try again.');
     case 'NotFoundError':
     case 'OverconstrainedError':
       return new Error('No microphone was found.');

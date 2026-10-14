@@ -75,7 +75,7 @@ export class ElementPlayer {
     } catch (e) {
       const name = (e as DOMException).name;
       if (name === 'AbortError') return; // superseded by a newer load()
-      if (name === 'NotAllowedError') throw new Error('The browser blocked autoplay. Press play to start.');
+      if (name === 'NotAllowedError') throw new Error('Tap ▶ to start. The browser blocked autoplay.');
       if (name === 'NotSupportedError') throw new Error(this.describeError());
       throw e;
     }
@@ -146,6 +146,6 @@ export class ElementPlayer {
     }
     if (this.kind === 'file') return 'This audio file could not be played (unsupported or corrupted format).';
     if (code === 3) return 'This audio could not be decoded (corrupted or unsupported format).';
-    return 'Could not load this audio URL. It must point directly to an audio file and the server must allow cross-origin requests (CORS: Access-Control-Allow-Origin).';
+    return 'Can\'t play this link. The server blocks other sites (CORS). Download the file and drop it here.';
   }
 }
