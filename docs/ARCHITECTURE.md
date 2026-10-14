@@ -74,8 +74,9 @@ UIs read `store.state`, subscribe for changes (`changed: Set<keyof AppState>`), 
 directly. `playback` is replaced by reference on every engine change.
 
 ### VR UI (src/ui/vr)
-* World-space panel ≈ 1.1 m × 0.7 m, 1.4 m in front of the head at ≈1.3 m height, slight downward tilt toward the face,
-  curved look is optional. Rendered with a CanvasTexture (2048×1280) redrawn only when state changes or hover changes.
+* World-space panel ≈ 1.4 m × 0.89 m, 1.4 m in front of the head at ≈1.3 m height, slight downward tilt toward the face.
+  Rendered with a CanvasTexture (2048×1304) redrawn only when state changes; hover, sliders and live readouts are GPU overlay quads.
+  Body text ≥ 44 px (≈1.2° at 1.4 m), hit targets ≥ 4 cm.
   Tabs: Player (now playing, progress/seek, transport, volume, queue), Scenes (preset tiles + palette chips + intensity/
   speed/glow sliders + auto-cycle), Sources (Mic on/off, Demo, YouTube/queue info, hint text), Settings (recenter, fps,
   background toggle, exit VR).

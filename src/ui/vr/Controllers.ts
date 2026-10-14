@@ -24,6 +24,8 @@ const BTN_B = 5; // B / Y
 
 const STICK_ON = 0.65;
 const STICK_OFF = 0.45;
+/** An axis wins over the other (and over the active direction) only when it is at least this much larger. */
+const STICK_AXIS_RATIO = 1.25;
 const STICK_FIRST_DELAY = 0.35;
 const STICK_VERTICAL_REPEAT = 0.12;
 const PINCH_ON = 0.02;
@@ -78,9 +80,72 @@ export class XRPointer {
 
 interface Entry {
   controller: THREE.XRTargetRaySpace;
+  grip: THREE.XRGripSpace;
   hand: THREE.XRHandSpace;
+  /** factory-built models: empty (no children) until the CDN asset has loaded, and again if it never does */
+  controllerModel: THREE.Object3D;
+  handModel: THREE.Object3D;
+  /** procedural stand-ins, visible exactly while the matching model above has no mesh */
+  fallbackController: THREE.Group;
+  fallbackDots: THREE.Mesh[];
   ray: RayVisual;
   cleanup: (() => void)[];
+}
+
+/** Joints that get a dot when the hand mesh is unavailable: wrist and the five finger tips. */
+const FALLBACK_HAND_JOINTS: readonly [string, number][] = [
+  ['wrist', 0.016], ['thumb-tip', 0.008], ['index-finger-tip', 0.008],
+  ['middle-finger-tip', 0.0075], ['ring-finger-tip', 0.007], ['pinky-finger-tip', 0.0065],
+];
+
+/**
+ * Offline-safe stand-ins for the controller and hand models, which are fetched from a CDN at runtime: a rounded
+ * capsule (the grip) with a tracking ring for controllers, and dots on the wrist / finger tips for hands.
+ * Tinted with the UI accent.
+ */
+class FallbackKit {
+  private capsule = new THREE.CapsuleGeometry(0.017, 0.085, 4, 12).rotateX(Math.PI / 2);
+  private ring = new THREE.TorusGeometry(0.036, 0.0045, 8, 28);
+  private dot = new THREE.SphereGeometry(1, 12, 8);
+  private bodyMat = new THREE.MeshBasicMaterial({ color: 0x20243c, toneMapped: false, fog: false });
+  private accentMat = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false, fog: false });
+  private tint = new THREE.Color(-1, -1, -1);
+
+  setAccent(c: THREE.Color): void {
+    if (this.tint.equals(c)) return;
+    this.tint.copy(c);
+    this.accentMat.color.copy(c);
+    this.bodyMat.color.copy(c).multiplyScalar(0.32);
+  }
+
+  /** Handle along the grip's z axis with the ring around its front end. */
+  createController(): THREE.Group {
+    const g = new THREE.Group();
+    g.name = 'resonance-vr-controller-fallback';
+    const body = new THREE.Mesh(this.capsule, this.bodyMat);
+    body.position.set(0, 0, 0.03);
+    const ring = new THREE.Mesh(this.ring, this.accentMat);
+    ring.position.set(0, 0.01, -0.04);
+    ring.rotation.x = -0.7;
+    g.add(body, ring);
+    g.visible = false;
+    return g;
+  }
+
+  createDot(radius: number): THREE.Mesh {
+    const m = new THREE.Mesh(this.dot, this.accentMat);
+    m.scale.setScalar(radius);
+    m.visible = false;
+    return m;
+  }
+
+  dispose(): void {
+    this.capsule.dispose();
+    this.ring.dispose();
+    this.dot.dispose();
+    this.bodyMat.dispose();
+    this.accentMat.dispose();
+  }
 }
 
 let dotTexture: THREE.CanvasTexture | null = null;
@@ -187,6 +252,7 @@ export class Controllers {
   readonly root = new THREE.Group();
   private entries: Entry[] = [];
   private scale = new THREE.Vector3();
+  private kit = new FallbackKit();
   private onSessionStart: () => void;
   private onSessionEnd: () => void;
 
@@ -201,8 +267,11 @@ export class Controllers {
       const grip = renderer.xr.getControllerGrip(i);
       const hand = renderer.xr.getHand(i);
       this.root.add(controller, grip, hand);
-      grip.add(modelFactory.createControllerModel(grip));
-      hand.add(handFactory.createHandModel(hand, 'mesh'));
+      const controllerModel = modelFactory.createControllerModel(grip);
+      const handModel = handFactory.createHandModel(hand, 'mesh');
+      const fallbackController = this.kit.createController();
+      grip.add(controllerModel, fallbackController);
+      hand.add(handModel);
       const ray = new RayVisual(this.root);
       const p = this.pointers[i];
       const cleanup: (() => void)[] = [];
@@ -241,7 +310,7 @@ export class Controllers {
         () => controller.removeEventListener('squeezestart', onSqueezeStart),
         () => controller.removeEventListener('squeezeend', onSqueezeEnd),
       );
-      this.entries.push({ controller, hand, ray, cleanup });
+      this.entries.push({ controller, grip, hand, controllerModel, handModel, fallbackController, fallbackDots: [], ray, cleanup });
     }
 
     this.onSessionStart = () => {
@@ -352,15 +421,21 @@ export class Controllers {
     if (b && !p.prevB) { h.activity(p); h.buttonB(p); }
     p.prevB = b;
 
-    // thumbstick with dead zone, hysteresis and repeat delay
+    // Thumbstick: dead zone, hysteresis and repeat delay. An active direction is kept until the stick returns
+    // (mag <= STICK_OFF); a different direction needs a deliberate push (mag > STICK_ON) whose axis clearly
+    // dominates, so spring-back overshoot and diagonal wobble never fire the opposite / other action.
     const ax = gp.axes;
     const sx = (ax.length >= 4 ? ax[2] : ax[0]) || 0;
     const sy = (ax.length >= 4 ? ax[3] : ax[1]) || 0;
     const mag = Math.hypot(sx, sy);
-    let dir: StickDir | null = null;
-    if (mag > (p.stickDir ? STICK_OFF : STICK_ON)) {
-      dir = Math.abs(sx) > Math.abs(sy) ? (sx > 0 ? 'right' : 'left') : (sy > 0 ? 'down' : 'up');
-    }
+    const horizontal = Math.abs(sx) >= Math.abs(sy);
+    const major = horizontal ? Math.abs(sx) : Math.abs(sy);
+    const minor = horizontal ? Math.abs(sy) : Math.abs(sx);
+    const pushed: StickDir = horizontal ? (sx > 0 ? 'right' : 'left') : (sy > 0 ? 'down' : 'up');
+    const deliberate = mag > STICK_ON && major > STICK_AXIS_RATIO * minor;
+    let dir: StickDir | null = p.stickDir;
+    if (mag <= STICK_OFF) dir = null;
+    else if (deliberate && pushed !== dir) dir = pushed;
     if (dir !== p.stickDir) {
       p.stickDir = dir;
       p.stickTimer = 0;
@@ -382,7 +457,31 @@ export class Controllers {
   /** Update beams and hit dots. `showRays` is false while the panel is hidden. */
   updateVisuals(dt: number, showRays: boolean, accent: THREE.Color): void {
     const presenting = this.renderer.xr.isPresenting;
-    for (let i = 0; i < 2; i++) this.entries[i].ray.update(this.pointers[i], showRays && presenting, accent, dt);
+    this.kit.setAccent(accent);
+    for (let i = 0; i < 2; i++) {
+      const e = this.entries[i];
+      const p = this.pointers[i];
+      e.ray.update(p, showRays && presenting, accent, dt);
+      this.updateFallbacks(e, p);
+    }
+  }
+
+  /** Show the procedural stand-in while (or whenever) the real model has no mesh; the real model wins once loaded. */
+  private updateFallbacks(e: Entry, p: XRPointer): void {
+    e.fallbackController.visible = p.connected && !p.isHand && e.controllerModel.children.length === 0;
+    const handFallback = p.connected && p.isHand && e.handModel.children.length === 0;
+    // joints are created by three on the first tracked frame, so attach the dots lazily
+    if (handFallback && e.fallbackDots.length === 0) {
+      const joints = e.hand.joints as Record<string, THREE.Object3D | undefined>;
+      if (FALLBACK_HAND_JOINTS.every(([name]) => joints[name])) {
+        for (const [name, radius] of FALLBACK_HAND_JOINTS) {
+          const dot = this.kit.createDot(radius);
+          joints[name]!.add(dot);
+          e.fallbackDots.push(dot);
+        }
+      }
+    }
+    for (const dot of e.fallbackDots) dot.visible = handFallback;
   }
 
   setVisible(v: boolean): void {
@@ -395,7 +494,12 @@ export class Controllers {
     for (const e of this.entries) {
       for (const fn of e.cleanup) fn();
       e.ray.dispose();
+      e.controllerModel.removeFromParent();
+      e.handModel.removeFromParent();
+      e.fallbackController.removeFromParent();
+      for (const dot of e.fallbackDots) dot.removeFromParent();
     }
+    this.kit.dispose();
     this.entries.length = 0;
     this.root.removeFromParent();
     if (dotTexture) { dotTexture.dispose(); dotTexture = null; }

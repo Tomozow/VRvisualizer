@@ -131,8 +131,9 @@ export class App implements Actions {
       if (t) this.toast(`▶ ${t.title}`);
     });
     this.engine.addEventListener('error', () => {
+      // The 2D overlay shows engine messages in its banner; in VR the toast is the only surface.
       const m = this.engine.playback.message;
-      if (m) this.toast(m, 4000);
+      if (m && this.store.state.mode === 'xr') this.toast(m, 5000);
     });
 
     this.overlay = new DomOverlay(overlayRoot, this.store, this, this.engine.features);

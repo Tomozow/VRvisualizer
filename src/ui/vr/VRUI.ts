@@ -18,8 +18,12 @@ export interface VRUIOptions {
 const AUTOHIDE_SECONDS = 12;
 const AUTOHIDE_STORAGE_KEY = 'resonance-vr.vrui.autohide';
 const VOLUME_STEP = 0.05;
-/** Re-place the menu in front of the user when it is re-shown while this far (cos of the angle) off-axis. */
+/** Re-place the menu in front of the user when it is re-shown while this far (cos of the angle) off-axis... */
 const RESHOW_MIN_COS = Math.cos(THREE.MathUtils.degToRad(75));
+/** ...or this far (m) from the head, e.g. after walking away from where it was left. */
+const RESHOW_MAX_DISTANCE = 2.2;
+/** Second recentre this long after a session starts, once tracking has settled (skipped if the menu is in use). */
+const SETTLE_SECONDS = 0.35;
 
 /**
  * In-VR user interface: controllers / hands with laser pointers, the world-space menu panel, the mini HUD
@@ -42,14 +46,25 @@ export class VRUI {
   private lastInteraction = 0;
   private autoHide = true;
   private visible = true;
-  private pendingRecenter = -1;
+  /** recentre on the first frame that has a head pose of the current session */
+  private recenterPending = false;
+  private settleTimer = -1;
   private debugHud = false;
   private cleanup: (() => void)[] = [];
 
+  // Head pose (XR viewer pose, or the desktop camera), refreshed every frame. `headValid` is false from the
+  // start of a session until its first pose arrives, so a previous session's pose is never used.
+  private headPos = new THREE.Vector3();
+  private headQuat = new THREE.Quaternion();
+  private headForward = new THREE.Vector3();
+  private headValid = false;
+
   // scratch
-  private head = new THREE.Vector3();
   private forward = new THREE.Vector3();
   private toPanel = new THREE.Vector3();
+  private parentPos = new THREE.Vector3();
+  private parentQuat = new THREE.Quaternion();
+  private parentScale = new THREE.Vector3();
 
   constructor(opts: VRUIOptions) {
     this.renderer = opts.renderer;
@@ -105,13 +120,17 @@ export class VRUI {
 
     const xr = opts.renderer.xr;
     const onStart = (): void => {
-      this.pendingRecenter = 0.35; // let the headset deliver its first pose
+      // The XR camera still holds the previous session's pose here: wait for the first frame that has a fresh one.
+      this.headValid = false;
+      this.recenterPending = true;
+      this.settleTimer = SETTLE_SECONDS;
       this.touch();
-      this.recenter();
     };
     const onEnd = (): void => {
-      this.pendingRecenter = -1;
-      this.recenter();
+      // App resets the desktop camera right after this event; recentre in front of it on the next frame.
+      this.headValid = false;
+      this.recenterPending = true;
+      this.settleTimer = -1;
     };
     xr.addEventListener('sessionstart', onStart);
     xr.addEventListener('sessionend', onEnd);
@@ -131,9 +150,11 @@ export class VRUI {
     const xr = this.renderer.xr.isPresenting;
     const state = this.store.state;
 
-    if (this.pendingRecenter >= 0) {
-      this.pendingRecenter -= dt;
-      if (this.pendingRecenter < 0) this.recenter();
+    const freshHead = this.sampleHead();
+    if (this.recenterPending && freshHead) this.recenter();
+    if (this.settleTimer >= 0) {
+      this.settleTimer -= dt;
+      if (this.settleTimer < 0 && freshHead && !this.panel.busy && !this.panel.hovered) this.recenter();
     }
 
     this.panel.step(dt);
@@ -144,7 +165,7 @@ export class VRUI {
     // 2. grabbing moves the panel; do it before hit-testing
     for (const p of this.controllers.pointers) {
       if (this.panel.grabSlotIndex === p.slot) {
-        if (p.squeeze && p.hasRay) this.panel.updateGrab(p.slot, p.origin, p.quaternion);
+        if (p.squeeze && p.hasRay && this.headValid) this.panel.updateGrab(p.slot, p.origin, this.headPos);
         else this.panel.endGrab(p.slot);
       }
     }
@@ -172,8 +193,8 @@ export class VRUI {
     this.panel.render(nowMs, xr);
     this.controllers.updateVisuals(dt, this.visible && this.panel.opacity > 0.05, this.panel.accentColor);
     this.hud.update(dt, {
-      anchorPos: this.panel.mesh.position,
-      anchorQuat: this.panel.mesh.quaternion,
+      head: this.headPos,
+      forward: this.headForward,
       menuVisible: this.panel.isShown && this.panel.opacity > 0.05,
       enabled: this.visible && (xr || this.debugHud),
       accent: this.panel.accent,
@@ -183,15 +204,14 @@ export class VRUI {
 
   /** Put the panel back in front of the user (XR head pose, or the desktop camera). */
   recenter(): void {
-    const xrCam = this.renderer.xr.getCamera();
-    if (this.renderer.xr.isPresenting && xrCam.cameras.length > 0) {
-      this.head.copy(xrCam.position);
-      this.forward.set(0, 0, -1).applyQuaternion(xrCam.quaternion);
-    } else {
-      this.camera.getWorldPosition(this.head);
-      this.camera.getWorldDirection(this.forward);
+    const fresh = this.sampleHead();
+    if (!fresh && !this.headValid) {
+      // inside a session that has not produced a pose yet: do it on the first frame that has one
+      this.recenterPending = true;
+      return;
     }
-    this.panel.place(this.head, this.forward);
+    this.recenterPending = false;
+    this.panel.place(this.headPos, this.headForward);
     this.touch();
   }
 
@@ -254,7 +274,7 @@ export class VRUI {
       return;
     }
     this.feed(p);
-    if (p.hasRay && this.panel.beginGrab(p.slot, p.origin, p.quaternion)) p.pulse(0.3, 30);
+    if (p.hasRay && this.panel.beginGrab(p.slot, p.origin)) p.pulse(0.3, 30);
   }
 
   private onStick(p: XRPointer, dir: StickDir): void {
@@ -281,14 +301,52 @@ export class VRUI {
     }
   }
 
-  /** When the menu comes back while the user looks elsewhere, bring it into view. */
+  /**
+   * Refresh the cached head pose: the XR viewer pose while presenting (never the stale camera array of an earlier
+   * session), the desktop camera otherwise. Returns true when this call produced a fresh pose.
+   */
+  private sampleHead(): boolean {
+    const xr = this.renderer.xr;
+    if (!xr.isPresenting) {
+      this.camera.getWorldPosition(this.headPos);
+      this.camera.getWorldQuaternion(this.headQuat);
+    } else {
+      // Only inside an XR frame callback: outside it (or before the first frame) there is no fresh pose.
+      const frame = xr.getFrame() as XRFrame | null;
+      const space = xr.getReferenceSpace();
+      const pose = frame && space ? frame.getViewerPose(space) : null;
+      if (!pose) return false;
+      const { position: p, orientation: o } = pose.transform;
+      this.headPos.set(p.x, p.y, p.z);
+      this.headQuat.set(o.x, o.y, o.z, o.w);
+      const parent = this.camera.parent;
+      if (parent) {
+        parent.updateWorldMatrix(true, false);
+        parent.matrixWorld.decompose(this.parentPos, this.parentQuat, this.parentScale);
+        this.headPos.applyMatrix4(parent.matrixWorld);
+        this.headQuat.premultiply(this.parentQuat);
+      }
+    }
+    this.headForward.set(0, 0, -1).applyQuaternion(this.headQuat);
+    this.headValid = true;
+    return true;
+  }
+
+  /** When the menu comes back while the user looks elsewhere (or has walked off), bring it into view. */
   private recenterIfBehind(): void {
-    const xrCam = this.renderer.xr.getCamera();
-    if (!this.renderer.xr.isPresenting || xrCam.cameras.length < 1 || this.panel.grabbing) return;
-    this.head.copy(xrCam.position);
-    this.forward.set(0, 0, -1).applyQuaternion(xrCam.quaternion);
+    if (!this.renderer.xr.isPresenting || this.panel.grabbing) return;
+    const fresh = this.sampleHead();
+    if (!fresh && !this.headValid) {
+      this.recenterPending = true;
+      return;
+    }
+    this.toPanel.copy(this.panel.mesh.position).sub(this.headPos);
+    if (this.toPanel.length() > RESHOW_MAX_DISTANCE) {
+      this.recenter();
+      return;
+    }
+    this.forward.copy(this.headForward);
     this.forward.y = 0;
-    this.toPanel.copy(this.panel.mesh.position).sub(this.head);
     this.toPanel.y = 0;
     const fl = this.forward.length();
     const pl = this.toPanel.length();

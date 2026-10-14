@@ -1,4 +1,4 @@
-/** Inline SVG icons (24x24, painted with currentColor via CSS) and small formatting helpers. */
+/** Inline SVG icons (24x24, painted with currentColor via CSS) and small HTML helpers. */
 
 const svg = (body: string): string =>
   `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">${body}</svg>`;
@@ -16,6 +16,7 @@ export const ICONS = {
   shuffle: svg('<path d="M10.6 9.2 5.4 4 4 5.4l5.2 5.2 1.4-1.4zM14.5 4l2 2L4 18.6 5.4 20 18 7.5l2 2V4h-5.5zm.3 9.4-1.4 1.4 3.1 3.1-2 2H20v-5.5l-2 2-3.2-3z"/>'),
   repeat: svg('<path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/>'),
   repeatOne: svg('<path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z"/>'),
+  volumeOff: svg('<path d="M3 9v6h4l5 5V4L7 9H3zm13.6 3 2.7-2.7-1.4-1.4-2.7 2.7-2.7-2.7-1.4 1.4 2.7 2.7-2.7 2.7 1.4 1.4 2.7-2.7 2.7 2.7 1.4-1.4z"/>'),
   volume: svg('<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4zM14 3.2v2.1c2.9.9 5 3.5 5 6.7s-2.1 5.8-5 6.7v2.1c4-.9 7-4.4 7-8.8s-3-7.9-7-8.8z"/>'),
   queue: svg('<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>'),
   mic: svg('<path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"/>'),
@@ -24,6 +25,7 @@ export const ICONS = {
   vr: svg('<path d="M3 8h18a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-5.2l-1.6-2.5H9.8L8.2 17H3a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/>'),
   eye: svg('<path d="M12 4.5C7 4.5 2.7 7.6 1 12c1.7 4.4 6 7.5 11 7.5s9.3-3.1 11-7.5c-1.7-4.4-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/>'),
   close: svg('<path d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/>'),
+  clipboard: svg('<path d="M19 3h-4.2A3 3 0 0 0 12 1a3 3 0 0 0-2.8 2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-7 0a1 1 0 1 1 0 2 1 1 0 0 1 0-2zm5 15H7v-2h10v2zm0-4H7v-2h10v2zm0-4H7V8h10v2z"/>'),
   eq: '<span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>',
 } as const;
 
@@ -31,12 +33,3 @@ const ESC: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"
 
 /** Escape text for use in HTML content or a quoted attribute. */
 export const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => ESC[c]);
-
-/** 83 -> "1:23", 3725 -> "1:02:05". Non-finite / negative input renders as 0:00. */
-export function fmtTime(sec: number): string {
-  const t = Number.isFinite(sec) && sec > 0 ? Math.floor(sec) : 0;
-  const h = Math.floor(t / 3600);
-  const m = Math.floor((t % 3600) / 60);
-  const s = String(t % 60).padStart(2, '0');
-  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
-}

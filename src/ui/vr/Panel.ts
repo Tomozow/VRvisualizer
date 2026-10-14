@@ -3,11 +3,13 @@ import type { Actions, AppState, Store } from '@/app/Store';
 import type { AudioFeatures, PlaybackState } from '@/audio/types';
 import { clamp } from '@/util/device';
 import {
-  COLOR, PANEL_M_H, PANEL_M_W, PANEL_PX_H, PANEL_PX_W, drawText, fillRound, font, hGradient, makeAccent, renderGlass,
+  COLOR, PANEL_M_H, PANEL_M_W, PANEL_PX_H, PANEL_PX_W, SLIDER, drawText, fillRound, font, hGradient, makeAccent, renderGlass,
   strokeRound, type Accent,
 } from './theme';
 import { drawPlayer, drawScenes, drawSettings, drawSources } from './tabs';
-import { ImageCache, WidgetList, type PanelLocal, type RenderInfo, type TabEnv, type Widget } from './ui';
+import {
+  ImageCache, LiveList, WidgetList, type LiveLabel, type LiveSlider, type PanelLocal, type RenderInfo, type TabEnv, type Widget,
+} from './ui';
 
 const TABS: { id: AppState['tab']; label: string }[] = [
   { id: 'player', label: 'Player' },
@@ -21,11 +23,19 @@ export const SLOT_COUNT = 3;
 export const SLOT_MOUSE = 2;
 
 const SHOW_SECONDS = 0.25;
-const LIVE_INTERVAL_MS = 100;
+/** Whole-canvas refresh for content that is not a GPU overlay (input meter, FPS read-out). */
+const LIVE_INTERVAL_MS = 250;
 const MIN_REDRAW_MS = 33;
-const DRAG_REDRAW_MS = 50;
 const PX_TO_M_X = PANEL_M_W / PANEL_PX_W;
 const PX_TO_M_Y = PANEL_M_H / PANEL_PX_H;
+
+/** Draw order and height above the panel plane (m) of everything layered on the panel. Depth-tested, not depth-written. */
+const RENDER_ORDER = { panel: 100, live: 101, hover: 102, beat: 103 } as const;
+const LIFT = { live: 0.002, hover: 0.004, beat: 0.006 } as const;
+
+/** While grabbed the panel stays upright and turns toward the head; its pitch is limited to this range (rad). */
+const GRAB_PITCH_MIN = -0.4;
+const GRAB_PITCH_MAX = 0.5;
 
 interface Slot {
   /** hover widget (used for the highlight overlay) */
@@ -83,13 +93,9 @@ void main() {
 class HoverOverlay {
   readonly mesh: THREE.Mesh;
   private mat: THREE.ShaderMaterial;
-  private static geometry: THREE.PlaneGeometry | null = null;
-  private static users = 0;
   private static readonly PAD = 22;
 
-  constructor() {
-    if (!HoverOverlay.geometry) HoverOverlay.geometry = new THREE.PlaneGeometry(1, 1);
-    HoverOverlay.users++;
+  constructor(plane: THREE.PlaneGeometry) {
     this.mat = new THREE.ShaderMaterial({
       uniforms: {
         uSize: { value: new THREE.Vector2(100, 100) },
@@ -102,15 +108,15 @@ class HoverOverlay {
       vertexShader: OVERLAY_VERT,
       fragmentShader: OVERLAY_FRAG,
       transparent: true,
-      depthTest: false,
+      depthTest: true,
       depthWrite: false,
       toneMapped: false,
     });
-    this.mesh = new THREE.Mesh(HoverOverlay.geometry, this.mat);
-    this.mesh.renderOrder = 101;
+    this.mesh = new THREE.Mesh(plane, this.mat);
+    this.mesh.renderOrder = RENDER_ORDER.hover;
     this.mesh.frustumCulled = false;
     this.mesh.visible = false;
-    this.mesh.position.z = 0.002;
+    this.mesh.position.z = LIFT.hover;
   }
 
   hide(): void {
@@ -133,10 +139,191 @@ class HoverOverlay {
 
   dispose(): void {
     this.mat.dispose();
-    if (--HoverOverlay.users === 0 && HoverOverlay.geometry) {
-      HoverOverlay.geometry.dispose();
-      HoverOverlay.geometry = null;
+  }
+}
+
+// Fill + knob of a slider, drawn on the GPU so dragging (or a playing progress bar) only changes uniforms.
+// The groove itself is part of the canvas. Colours arrive in sRGB, are mixed like the canvas gradient would,
+// then converted to linear for the output stage.
+const SLIDER_FRAG = /* glsl */ `
+uniform vec2 uSize;
+uniform float uW;
+uniform float uT;
+uniform vec3 uColA;
+uniform vec3 uColB;
+uniform float uDisabled;
+uniform float uAlpha;
+varying vec2 vUv;
+vec3 srgbToLinear(vec3 c) {
+  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+float cover(float d) { return 1.0 - smoothstep(-0.75, 0.75, d); }
+void layer(inout vec4 acc, vec3 c, float a) {
+  acc.rgb = c * a + acc.rgb * (1.0 - a);
+  acc.a = a + acc.a * (1.0 - a);
+}
+float sdRoundRect(vec2 p, vec2 b, float r) {
+  vec2 q = abs(p) - b + r;
+  return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+}
+void main() {
+  vec2 p = (vUv - 0.5) * uSize;
+  float x0 = -0.5 * uW;
+  float kx = x0 + uW * uT;
+  vec4 acc = vec4(0.0);
+  if (uDisabled < 0.5 && uT > 0.001) {
+    float len = max(${SLIDER.barH.toFixed(1)}, uW * uT);
+    float d = sdRoundRect(p - vec2(x0 + 0.5 * len, 0.0), vec2(0.5 * len, ${(SLIDER.barH / 2).toFixed(1)}), ${(SLIDER.barH / 2).toFixed(1)});
+    vec3 c = srgbToLinear(mix(uColA, uColB, clamp((p.x - x0) / uW, 0.0, 1.0)));
+    layer(acc, c, cover(d));
+  }
+  float dk = length(p - vec2(kx, 0.0));
+  if (uDisabled > 0.5) {
+    layer(acc, vec3(1.0), cover(dk - ${SLIDER.knobDisabled.toFixed(1)}) * 0.35);
+  } else {
+    layer(acc, srgbToLinear(uColA), cover(dk - ${SLIDER.knobGlow.toFixed(1)}) * 0.25);
+    layer(acc, vec3(1.0), cover(dk - ${SLIDER.knobR.toFixed(1)}));
+    layer(acc, srgbToLinear(uColA), cover(dk - ${SLIDER.knobCore.toFixed(1)}));
+  }
+  gl_FragColor = vec4(acc.rgb / max(acc.a, 1e-4), acc.a * uAlpha);
+  #include <colorspace_fragment>
+}`;
+
+class LiveSliderQuad {
+  readonly mesh: THREE.Mesh;
+  private mat: THREE.ShaderMaterial;
+  private spec: LiveSlider | null = null;
+  private accent: Accent | null = null;
+  /** room around the groove for the knob glow, canvas px */
+  private static readonly PAD_X = SLIDER.knobGlow + 10;
+  private static readonly H = SLIDER.knobGlow * 2 + 20;
+
+  constructor(plane: THREE.PlaneGeometry) {
+    this.mat = new THREE.ShaderMaterial({
+      uniforms: {
+        uSize: { value: new THREE.Vector2(100, 100) },
+        uW: { value: 100 },
+        uT: { value: 0 },
+        uColA: { value: new THREE.Vector3(1, 1, 1) },
+        uColB: { value: new THREE.Vector3(1, 1, 1) },
+        uDisabled: { value: 0 },
+        uAlpha: { value: 0 },
+      },
+      vertexShader: OVERLAY_VERT,
+      fragmentShader: SLIDER_FRAG,
+      transparent: true,
+      depthTest: true,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    this.mesh = new THREE.Mesh(plane, this.mat);
+    this.mesh.renderOrder = RENDER_ORDER.live;
+    this.mesh.frustumCulled = false;
+    this.mesh.visible = false;
+    this.mesh.position.z = LIFT.live;
+  }
+
+  bind(s: LiveSlider): void {
+    this.spec = s;
+    const wPx = s.w + LiveSliderQuad.PAD_X * 2;
+    const u = this.mat.uniforms;
+    (u.uSize.value as THREE.Vector2).set(wPx, LiveSliderQuad.H);
+    u.uW.value = s.w;
+    u.uDisabled.value = s.disabled ? 1 : 0;
+    this.mesh.scale.set(wPx * PX_TO_M_X, LiveSliderQuad.H * PX_TO_M_Y, 1);
+    this.mesh.position.x = (s.x + s.w / 2 - PANEL_PX_W / 2) * PX_TO_M_X;
+    this.mesh.position.y = (PANEL_PX_H / 2 - s.cy) * PX_TO_M_Y;
+  }
+
+  unbind(): void {
+    this.spec = null;
+    this.mesh.visible = false;
+  }
+
+  update(accent: Accent, alpha: number): void {
+    const s = this.spec;
+    if (!s) return;
+    if (accent !== this.accent) {
+      this.accent = accent;
+      (this.mat.uniforms.uColA.value as THREE.Vector3).set(accent.main[0] / 255, accent.main[1] / 255, accent.main[2] / 255);
+      (this.mat.uniforms.uColB.value as THREE.Vector3).set(accent.alt[0] / 255, accent.alt[1] / 255, accent.alt[2] / 255);
     }
+    this.mat.uniforms.uT.value = clamp(s.value(), 0, 1);
+    this.mat.uniforms.uAlpha.value = alpha;
+    this.mesh.visible = alpha > 0.01;
+  }
+
+  dispose(): void {
+    this.mat.dispose();
+  }
+}
+
+/** A small text texture (re-rendered only when its value changes) for read-outs that tick while the canvas stands still. */
+class LiveTextQuad {
+  readonly mesh: THREE.Mesh;
+  private static readonly W = 256;
+  private static readonly H = 72;
+  private canvas: HTMLCanvasElement;
+  private ctx: CanvasRenderingContext2D;
+  private texture: THREE.CanvasTexture;
+  private mat: THREE.MeshBasicMaterial;
+  private spec: LiveLabel | null = null;
+  private lastSig = Number.NaN;
+
+  constructor(plane: THREE.PlaneGeometry) {
+    this.canvas = document.createElement('canvas');
+    this.canvas.width = LiveTextQuad.W;
+    this.canvas.height = LiveTextQuad.H;
+    const ctx = this.canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas 2D is not available');
+    this.ctx = ctx;
+    this.texture = new THREE.CanvasTexture(this.canvas);
+    this.texture.colorSpace = THREE.SRGBColorSpace;
+    this.texture.anisotropy = 4;
+    this.mat = new THREE.MeshBasicMaterial({
+      map: this.texture, transparent: true, depthTest: true, depthWrite: false, toneMapped: false, fog: false, opacity: 0,
+    });
+    this.mesh = new THREE.Mesh(plane, this.mat);
+    this.mesh.scale.set(LiveTextQuad.W * PX_TO_M_X, LiveTextQuad.H * PX_TO_M_Y, 1);
+    this.mesh.renderOrder = RENDER_ORDER.live;
+    this.mesh.frustumCulled = false;
+    this.mesh.visible = false;
+  }
+
+  bind(s: LiveLabel): void {
+    this.spec = s;
+    this.lastSig = Number.NaN;
+    const cx = s.align === 'left' ? s.x + LiveTextQuad.W / 2 : s.x - LiveTextQuad.W / 2;
+    this.mesh.position.set((cx - PANEL_PX_W / 2) * PX_TO_M_X, (PANEL_PX_H / 2 - s.cy) * PX_TO_M_Y, LIFT.live);
+  }
+
+  unbind(): void {
+    this.spec = null;
+    this.mesh.visible = false;
+  }
+
+  update(alpha: number): void {
+    const s = this.spec;
+    if (!s) return;
+    const sig = s.sig();
+    if (sig !== this.lastSig) {
+      this.lastSig = sig;
+      const c = this.ctx;
+      c.clearRect(0, 0, LiveTextQuad.W, LiveTextQuad.H);
+      c.font = font(s.size, s.weight);
+      c.fillStyle = s.color;
+      c.textAlign = s.align;
+      c.textBaseline = 'middle';
+      c.fillText(s.text(sig), s.align === 'left' ? 0 : LiveTextQuad.W, LiveTextQuad.H / 2 + 2);
+      this.texture.needsUpdate = true;
+    }
+    this.mat.opacity = alpha;
+    this.mesh.visible = alpha > 0.01;
+  }
+
+  dispose(): void {
+    this.mat.dispose();
+    this.texture.dispose();
   }
 }
 
@@ -153,10 +340,14 @@ export class Panel {
   private glassKey = '';
   private texture: THREE.CanvasTexture;
   private material: THREE.MeshBasicMaterial;
+  private plane = new THREE.PlaneGeometry(1, 1);
   private overlays: HoverOverlay[] = [];
+  private liveSliders: LiveSliderQuad[] = [];
+  private liveTexts: LiveTextQuad[] = [];
   private beatDot: THREE.Mesh;
   private beatMat: THREE.MeshBasicMaterial;
   private widgets = new WidgetList();
+  private live = new LiveList();
   private images: ImageCache;
   private local: PanelLocal = { queueTop: null, lastIndex: -1, scenePage: null, lastVolume: 0.7 };
   private env: TabEnv;
@@ -180,21 +371,22 @@ export class Panel {
   private beatY = 0;
   private nowMs = 0;
 
+  /** last `playback` the redraw filter has seen (to tell a clock tick from a real change) */
+  private lastPb: PlaybackState;
+
   // playhead extrapolation
   private pbRef: PlaybackState | null = null;
   private pbTime = 0;
   private pbAt = 0;
 
-  // grab
+  // grab: the controller moves the panel, it never rolls or pitches it
   private grabSlot = -1;
-  private grabPos = new THREE.Vector3();
-  private grabQuat = new THREE.Quaternion();
+  private grabOffset = new THREE.Vector3();
 
   // scratch
   private inv = new THREE.Matrix4();
   private tmpN = new THREE.Vector3();
   private tmpV = new THREE.Vector3();
-  private tmpQ = new THREE.Quaternion();
 
   constructor(private opts: PanelOptions) {
     const { renderer, scene, store } = opts;
@@ -214,14 +406,14 @@ export class Panel {
     this.material = new THREE.MeshBasicMaterial({
       map: this.texture,
       transparent: true,
-      depthTest: false,
+      depthTest: true,
       depthWrite: false,
       toneMapped: false,
       fog: false,
       opacity: 0,
     });
     this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(PANEL_M_W, PANEL_M_H), this.material);
-    this.mesh.renderOrder = 100;
+    this.mesh.renderOrder = RENDER_ORDER.panel;
     this.mesh.frustumCulled = false;
     this.mesh.visible = false;
     this.mesh.rotation.order = 'YXZ';
@@ -232,19 +424,19 @@ export class Panel {
 
     for (let i = 0; i < SLOT_COUNT; i++) {
       this.slots.push({ hover: null, down: null, drag: null, inside: false, px: 0, py: 0 });
-      const o = new HoverOverlay();
+      const o = new HoverOverlay(this.plane);
       this.overlays.push(o);
       this.mesh.add(o.mesh);
     }
 
     this.beatMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff, transparent: true, depthTest: false, depthWrite: false, toneMapped: false, fog: false,
+      color: 0xffffff, transparent: true, depthTest: true, depthWrite: false, toneMapped: false, fog: false,
       blending: THREE.AdditiveBlending,
     });
-    this.beatDot = new THREE.Mesh(new THREE.CircleGeometry(0.0105, 32), this.beatMat);
-    this.beatDot.renderOrder = 101;
+    this.beatDot = new THREE.Mesh(new THREE.CircleGeometry(19 * PX_TO_M_X, 32), this.beatMat);
+    this.beatDot.renderOrder = RENDER_ORDER.beat;
     this.beatDot.frustumCulled = false;
-    this.beatDot.position.z = 0.003;
+    this.beatDot.position.z = LIFT.beat;
     this.mesh.add(this.beatDot);
 
     this.accent = makeAccent(undefined);
@@ -259,9 +451,11 @@ export class Panel {
       features: opts.features,
       accent: this.accent,
       widgets: this.widgets,
+      live: this.live,
       images: this.images,
       local: this.local,
       time: 0,
+      playhead: () => this.displayTime(this.nowMs),
       presenting: false,
       autoHide: opts.getAutoHide(),
       setAutoHide: (v) => { opts.setAutoHide(v); this.dirty = true; },
@@ -272,11 +466,19 @@ export class Panel {
       nowMs: 0,
     };
 
+    this.lastPb = store.state.playback;
     this.unsub = store.subscribe((state, changed) => {
       if (changed.has('palette') || changed.has('palettes')) this.refreshAccent(state);
       for (const k of changed) {
         if (k === 'toast' || k === 'menuVisible') continue;
         if (k === 'fps' && state.tab !== 'settings') continue;
+        if (k === 'playback') {
+          // The engine emits ~10×/s while playing, only to advance currentTime. The playhead and the time
+          // read-out are live overlays driven by the extrapolated clock, so a pure clock tick needs no redraw.
+          const prev = this.lastPb;
+          this.lastPb = state.playback;
+          if (onlyClockChanged(prev, state.playback)) continue;
+        }
         this.dirty = true;
       }
     });
@@ -372,20 +574,26 @@ export class Panel {
     this.inv.copy(this.mesh.matrixWorld).invert();
   }
 
-  beginGrab(slot: number, pos: THREE.Vector3, quat: THREE.Quaternion): boolean {
+  /** The panel keeps its offset to the controller (position only); the controller's roll never reaches the text. */
+  beginGrab(slot: number, pos: THREE.Vector3): boolean {
     if (this.grabSlot >= 0 || !this.interactive || !this.slots[slot].inside) return false;
     this.grabSlot = slot;
-    // panel pose expressed in the controller frame
-    const inv = this.tmpQ.copy(quat).invert();
-    this.grabPos.copy(this.mesh.position).sub(pos).applyQuaternion(inv);
-    this.grabQuat.copy(inv).multiply(this.mesh.quaternion);
+    this.grabOffset.copy(this.mesh.position).sub(pos);
     return true;
   }
 
-  updateGrab(slot: number, pos: THREE.Vector3, quat: THREE.Quaternion): void {
+  /** Follow the controller position; stay upright, yawed toward `head`, with the pitch limited. */
+  updateGrab(slot: number, pos: THREE.Vector3, head: THREE.Vector3): void {
     if (slot !== this.grabSlot) return;
-    this.mesh.quaternion.copy(quat).multiply(this.grabQuat);
-    this.mesh.position.copy(this.grabPos).applyQuaternion(quat).add(pos);
+    const p = this.mesh.position.copy(pos).add(this.grabOffset);
+    const dx = head.x - p.x;
+    const dz = head.z - p.z;
+    const horizontal = Math.hypot(dx, dz);
+    // head straight above / below the panel: keep the current heading
+    if (horizontal > 0.05) {
+      const pitch = clamp(Math.atan2(head.y - p.y, horizontal), GRAB_PITCH_MIN, GRAB_PITCH_MAX);
+      this.mesh.rotation.set(-pitch, Math.atan2(dx, dz), 0);
+    }
     this.refreshMatrices();
   }
 
@@ -471,11 +679,11 @@ export class Panel {
       const w = this.widgets.hit(s.px, s.py);
       if (!w) return false;
       s.down = w;
-      this.dirty = true;
       if (w.drag) {
         s.drag = w;
         w.drag(s.px, s.py, 'start');
       } else if (w.click) {
+        this.dirty = true;
         w.click();
       }
       return true;
@@ -484,6 +692,7 @@ export class Panel {
       const d = s.drag;
       s.drag = null;
       d.drag!(s.px, s.py, 'end');
+      this.dirty = true; // canvas redraws are paused while dragging: sync once at the end
     }
     s.down = null;
     return false;
@@ -519,10 +728,14 @@ export class Panel {
     const sinceDraw = nowMs - this.lastDrawMs;
     let dragging = false;
     for (const s of this.slots) if (s.drag) dragging = true;
+    // While a slider is dragged only its overlays move; the (10 MB) canvas texture is left alone until release.
     let need = false;
-    if (this.dirty && sinceDraw >= (dragging ? DRAG_REDRAW_MS : MIN_REDRAW_MS)) need = true;
-    else if (sinceDraw >= LIVE_INTERVAL_MS && this.liveSig(nowMs) !== this.drawnSig) need = true;
+    if (!dragging) {
+      if (this.dirty && sinceDraw >= MIN_REDRAW_MS) need = true;
+      else if (sinceDraw >= LIVE_INTERVAL_MS && this.liveSig(nowMs) !== this.drawnSig) need = true;
+    }
     if (need) this.draw(nowMs, presenting);
+    this.updateLive();
 
     // hover / pressed highlights
     for (let i = 0; i < SLOT_COUNT; i++) {
@@ -545,6 +758,28 @@ export class Panel {
     this.beatDot.position.y = (PANEL_PX_H / 2 - this.beatY) * PX_TO_M_Y;
   }
 
+  /** Give every live slider / read-out registered by the last draw a quad (pooled), hide the rest. */
+  private bindLive(): void {
+    const { sliders, labels } = this.live;
+    while (this.liveSliders.length < sliders.length) {
+      const q = new LiveSliderQuad(this.plane);
+      this.liveSliders.push(q);
+      this.mesh.add(q.mesh);
+    }
+    while (this.liveTexts.length < labels.length) {
+      const q = new LiveTextQuad(this.plane);
+      this.liveTexts.push(q);
+      this.mesh.add(q.mesh);
+    }
+    this.liveSliders.forEach((q, i) => (i < sliders.length ? q.bind(sliders[i]) : q.unbind()));
+    this.liveTexts.forEach((q, i) => (i < labels.length ? q.bind(labels[i]) : q.unbind()));
+  }
+
+  private updateLive(): void {
+    for (const q of this.liveSliders) q.update(this.accent, this.eased);
+    for (const q of this.liveTexts) q.update(this.eased);
+  }
+
   private syncClock(nowMs: number): void {
     const pb = this.opts.store.state.playback;
     if (pb !== this.pbRef || pb.currentTime !== this.pbTime) {
@@ -565,15 +800,12 @@ export class Panel {
   private liveSig(nowMs: number): number {
     const s = this.opts.store.state;
     switch (s.tab) {
-      case 'player': {
-        const pb = s.playback;
-        if (!pb.track || !pb.playing) return -1;
-        const t = this.displayTime(nowMs);
-        return Math.floor(t) * 1000 + (pb.duration > 0 ? Math.round((t / pb.duration) * 690) : 0);
-      }
+      case 'player':
+        // the progress knob and the time read-out are live overlays: nothing on the canvas ticks
+        return -1;
       case 'sources': {
         const f = this.opts.features;
-        return Math.round(f.level * 26) * 4 + (f.silence ? 1 : 0) + (f.active ? 2 : 0);
+        return Math.round(f.level * 24) * 4 + (f.silence ? 1 : 0) + (f.active ? 2 : 0);
       }
       case 'settings':
         return Math.floor(nowMs / 1000);
@@ -633,6 +865,7 @@ export class Panel {
     ctx.clearRect(0, 0, PANEL_PX_W, PANEL_PX_H);
     ctx.drawImage(this.glass, 0, 0);
     this.widgets.clear();
+    this.live.clear();
     this.drawHeader(state);
     switch (state.tab) {
       case 'player': drawPlayer(env); break;
@@ -640,6 +873,7 @@ export class Panel {
       case 'sources': drawSources(env); break;
       case 'settings': drawSettings(env); break;
     }
+    this.bindLive();
     this.texture.needsUpdate = true;
     this.dirty = false;
     this.lastDrawMs = nowMs;
@@ -698,6 +932,11 @@ export class Panel {
     this.cancelAll();
     this.mesh.removeFromParent();
     for (const o of this.overlays) o.dispose();
+    for (const q of this.liveSliders) { q.mesh.removeFromParent(); q.dispose(); }
+    for (const q of this.liveTexts) { q.mesh.removeFromParent(); q.dispose(); }
+    this.liveSliders.length = 0;
+    this.liveTexts.length = 0;
+    this.plane.dispose();
     this.beatDot.geometry.dispose();
     this.beatMat.dispose();
     this.mesh.geometry.dispose();
@@ -705,4 +944,13 @@ export class Panel {
     this.texture.dispose();
     this.images.dispose();
   }
+}
+
+/** True when `next` differs from `prev` in nothing but the playhead position. */
+function onlyClockChanged(prev: PlaybackState, next: PlaybackState): boolean {
+  const a = prev as unknown as Record<string, unknown>;
+  const b = next as unknown as Record<string, unknown>;
+  for (const k of Object.keys(b)) if (k !== 'currentTime' && a[k] !== b[k]) return false;
+  for (const k of Object.keys(a)) if (!(k in b)) return false;
+  return true;
 }

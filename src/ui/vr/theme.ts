@@ -1,10 +1,27 @@
 import type { Palette } from '@/viz/types';
 
-/** Panel canvas size in pixels and the world size of the quad it is mapped onto. */
+/** Panel canvas size in pixels and the world size of the quad it is mapped onto (square pixels). */
 export const PANEL_PX_W = 2048;
 export const PANEL_PX_H = 1304;
-export const PANEL_M_W = 1.1;
-export const PANEL_M_H = 0.7;
+export const PANEL_M_W = 1.4;
+export const PANEL_M_H = (PANEL_M_W * PANEL_PX_H) / PANEL_PX_W;
+/** World size of one canvas pixel in millimetres (≈ 0.68 mm). */
+export const MM_PER_PX = (PANEL_M_W / PANEL_PX_W) * 1000;
+/** Smallest hit target edge in canvas pixels: 44 mm, above the 40 mm quality bar. */
+export const MIN_HIT_PX = Math.ceil(44 / MM_PER_PX);
+
+/**
+ * Type scale in canvas pixels. At 1.4 m, 44 px ≈ 1.23° and 48 px ≈ 1.34° (quality bar: ≥ 1.2°), so nothing
+ * on the panel or HUD is set smaller than `label`.
+ */
+export const FS = {
+  /** uppercase section labels, badges, counters, key caps, secondary captions */
+  label: 44,
+  /** body text and values */
+  body: 48,
+  /** names and titles */
+  title: 56,
+} as const;
 
 export const FONT_FAMILY = '"Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif';
 
@@ -15,8 +32,9 @@ export function font(size: number, weight = 600): string {
 export const COLOR = {
   ink: '#05060d',
   text: '#f4f6ff',
-  textDim: '#a9b1d6',
-  textFaint: '#7882a8',
+  textDim: '#c9cfe8',
+  /** the dimmest text on the panel; still ≥ #a8b0cc so 44 px captions stay readable on the dark glass */
+  textFaint: '#aab2d0',
   surface: 'rgba(255,255,255,0.055)',
   surfaceStrong: 'rgba(255,255,255,0.10)',
   stroke: 'rgba(255,255,255,0.10)',
@@ -323,7 +341,7 @@ export function drawSeekIcon(ctx: CanvasRenderingContext2D, dir: -1 | 1, cx: num
   ctx.closePath();
   ctx.fill();
   ctx.restore();
-  drawText(ctx, '10', cx, cy + size * 0.015, Math.max(36, size * 0.375), color, { weight: 800, align: 'center', baseline: 'middle' });
+  drawText(ctx, '10', cx, cy + size * 0.015, Math.max(FS.label, size * 0.375), color, { weight: 800, align: 'center', baseline: 'middle' });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -335,22 +353,15 @@ export function drawCard(ctx: CanvasRenderingContext2D, x: number, y: number, w:
   strokeRound(ctx, x + 1, y + 1, w - 2, h - 2, r, COLOR.stroke, 2);
 }
 
-/** Horizontal slider; `t` in 0..1. Returns nothing: the caller registers the hit rect. */
-export function drawSlider(ctx: CanvasRenderingContext2D, x: number, cy: number, w: number, t: number, a: Accent, disabled = false): void {
-  const h = 16;
-  const tt = Math.max(0, Math.min(1, t));
-  fillRound(ctx, x, cy - h / 2, w, h, h / 2, 'rgba(255,255,255,0.13)');
-  if (tt > 0.001) {
-    fillRound(ctx, x, cy - h / 2, Math.max(h, w * tt), h, h / 2, disabled ? 'rgba(255,255,255,0.25)' : hGradient(ctx, x, x + w, a.mainCss, a.altCss));
-  }
-  const kx = x + w * tt;
-  if (!disabled) {
-    circle(ctx, kx, cy, 34, a.glow.replace(/[\d.]+\)$/, '0.25)'));
-    circle(ctx, kx, cy, 24, '#ffffff');
-    circle(ctx, kx, cy, 12, a.mainCss);
-  } else {
-    circle(ctx, kx, cy, 20, 'rgba(255,255,255,0.35)');
-  }
+/** Slider geometry shared with the GPU overlay that draws the fill and knob (see Panel's LiveSliderQuad). */
+export const SLIDER = { barH: 16, knobGlow: 34, knobR: 24, knobCore: 12, knobDisabled: 20 } as const;
+
+/**
+ * The static groove of a horizontal slider. The filled part and the knob are not drawn here: they live in a
+ * small shader quad on top of the panel so dragging never needs a canvas redraw / texture upload.
+ */
+export function drawSliderTrack(ctx: CanvasRenderingContext2D, x: number, cy: number, w: number): void {
+  fillRound(ctx, x, cy - SLIDER.barH / 2, w, SLIDER.barH, SLIDER.barH / 2, 'rgba(255,255,255,0.13)');
 }
 
 export function drawSwitch(ctx: CanvasRenderingContext2D, x: number, cy: number, on: boolean, a: Accent): void {
@@ -365,18 +376,18 @@ export function drawPaletteChip(ctx: CanvasRenderingContext2D, x: number, y: num
   const g = ctx.createLinearGradient(x, 0, x + w, 0);
   const n = Math.max(1, stops.length - 1);
   stops.forEach((s, i) => g.addColorStop(i / n, s));
-  fillRound(ctx, x, y, w, h, 22, g);
+  fillRound(ctx, x, y, w, h, 24, g);
   // scrim so the label stays readable on bright stops
-  fillRound(ctx, x, y + h * 0.5, w, h * 0.5, 22, vGradient(ctx, y + h * 0.5, y + h, 'rgba(0,0,0,0)', 'rgba(3,4,10,0.78)'));
+  fillRound(ctx, x, y + h * 0.3, w, h * 0.7, 24, vGradient(ctx, y + h * 0.3, y + h, 'rgba(0,0,0,0)', 'rgba(3,4,10,0.84)'));
   ctx.save();
-  ctx.font = font(36, 700);
-  drawText(ctx, fitText(ctx, name, w - 28), x + w / 2, y + h - 18, 36, '#ffffff', { weight: 700, align: 'center' });
+  ctx.font = font(FS.label, 700);
+  drawText(ctx, fitText(ctx, name, w - 24), x + w / 2, y + h - 22, FS.label, '#ffffff', { weight: 700, align: 'center' });
   ctx.restore();
   if (active) {
-    strokeRound(ctx, x - 4, y - 4, w + 8, h + 8, 26, '#ffffff', 5);
-    strokeRound(ctx, x - 9, y - 9, w + 18, h + 18, 30, a.glow, 4);
+    strokeRound(ctx, x - 4, y - 4, w + 8, h + 8, 28, '#ffffff', 5);
+    strokeRound(ctx, x - 9, y - 9, w + 18, h + 18, 32, a.glow, 4);
   } else {
-    strokeRound(ctx, x + 1, y + 1, w - 2, h - 2, 22, 'rgba(255,255,255,0.18)', 2);
+    strokeRound(ctx, x + 1, y + 1, w - 2, h - 2, 24, 'rgba(255,255,255,0.18)', 2);
   }
 }
 
@@ -396,12 +407,12 @@ export function drawMeter(ctx: CanvasRenderingContext2D, x: number, y: number, w
 
 /** Small key-cap label (controller legend). Returns its width. */
 export function drawKeycap(ctx: CanvasRenderingContext2D, x: number, cy: number, label: string, a: Accent): number {
-  ctx.font = font(36, 800);
-  const w = Math.ceil(ctx.measureText(label).width) + 44;
-  const h = 64;
-  fillRound(ctx, x, cy - h / 2, w, h, 16, 'rgba(255,255,255,0.08)');
-  strokeRound(ctx, x + 1.5, cy - h / 2 + 1.5, w - 3, h - 3, 15, a.glow, 3);
-  drawText(ctx, label, x + w / 2, cy + 1, 36, COLOR.text, { weight: 800, align: 'center', baseline: 'middle' });
+  ctx.font = font(FS.label, 800);
+  const w = Math.ceil(ctx.measureText(label).width) + 40;
+  const h = 72;
+  fillRound(ctx, x, cy - h / 2, w, h, 18, 'rgba(255,255,255,0.08)');
+  strokeRound(ctx, x + 1.5, cy - h / 2 + 1.5, w - 3, h - 3, 17, a.glow, 3);
+  drawText(ctx, label, x + w / 2, cy + 2, FS.label, COLOR.text, { weight: 800, align: 'center', baseline: 'middle' });
   return w;
 }
 

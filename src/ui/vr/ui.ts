@@ -1,6 +1,6 @@
 import type { Actions, AppState } from '@/app/Store';
 import type { AudioFeatures } from '@/audio/types';
-import type { Accent } from './theme';
+import { MIN_HIT_PX, type Accent } from './theme';
 
 /**
  * Tiny retained-widget layer for the canvas panel. Every redraw rebuilds the list of hit rects; the
@@ -29,7 +29,16 @@ export class WidgetList {
     this.items.length = 0;
   }
 
+  /** Registers a hit rect, growing it around its centre to the minimum comfortable target size (44 mm). */
   add(w: Widget): void {
+    if (w.w < MIN_HIT_PX) {
+      w.x -= (MIN_HIT_PX - w.w) / 2;
+      w.w = MIN_HIT_PX;
+    }
+    if (w.h < MIN_HIT_PX) {
+      w.y -= (MIN_HIT_PX - w.h) / 2;
+      w.h = MIN_HIT_PX;
+    }
     this.items.push(w);
   }
 
@@ -45,6 +54,44 @@ export class WidgetList {
   find(key: string): Widget | null {
     for (let i = this.items.length - 1; i >= 0; i--) if (this.items[i].key === key) return this.items[i];
     return null;
+  }
+}
+
+/**
+ * Things that change every frame (slider fill + knob, time and value read-outs) are not part of the canvas:
+ * the panel renders them as small GPU overlays so a drag or a ticking clock never re-uploads the whole texture.
+ * Tabs register them while drawing; the panel evaluates the callbacks every frame.
+ */
+export interface LiveSlider {
+  /** groove left edge, vertical centre and length in canvas pixels */
+  x: number;
+  cy: number;
+  w: number;
+  /** 0..1, read every frame (held drag value, store value or playhead) */
+  value(): number;
+  disabled?: boolean;
+}
+
+export interface LiveLabel {
+  /** anchor point (left or right edge) and vertical centre in canvas pixels */
+  x: number;
+  cy: number;
+  align: 'left' | 'right';
+  size: number;
+  weight: number;
+  color: string;
+  /** cheap integer signature read every frame; the label is re-rendered only when it changes */
+  sig(): number;
+  text(sig: number): string;
+}
+
+export class LiveList {
+  readonly sliders: LiveSlider[] = [];
+  readonly labels: LiveLabel[] = [];
+
+  clear(): void {
+    this.sliders.length = 0;
+    this.labels.length = 0;
   }
 }
 
@@ -111,10 +158,13 @@ export interface TabEnv {
   features: AudioFeatures;
   accent: Accent;
   widgets: WidgetList;
+  live: LiveList;
   images: ImageCache;
   local: PanelLocal;
-  /** Extrapolated playhead position in seconds */
+  /** Extrapolated playhead position in seconds, sampled when the canvas was drawn */
   time: number;
+  /** Extrapolated playhead position right now (for live overlays) */
+  playhead(): number;
   presenting: boolean;
   autoHide: boolean;
   setAutoHide(v: boolean): void;

@@ -1,16 +1,26 @@
 import type { SourceKind, Track } from '@/audio/types';
 import { clamp, detectQuality } from '@/util/device';
 import {
-  COLOR, circle, drawCard, drawIcon, drawKeycap, drawMeter, drawPaletteChip, drawSeekIcon, drawSlider, drawSwitch, drawText,
-  fillRound, fitText, font, formatTime, hGradient, roundRectPath, strokeRound, wrapText, rgba,
+  COLOR, FS, circle, drawCard, drawIcon, drawKeycap, drawMeter, drawPaletteChip, drawSeekIcon, drawSliderTrack, drawSwitch,
+  drawText, fillRound, fitText, font, formatTime, hGradient, roundRectPath, strokeRound, wrapText, rgba,
   type IconName,
 } from './theme';
-import type { TabEnv } from './ui';
+import type { LiveLabel, TabEnv } from './ui';
+
+/**
+ * Layout notes: the canvas is 2048 × 1304 px mapped onto 1.4 × 0.89 m, so 1 px ≈ 0.68 mm. Every piece of text is at
+ * least `FS.label` (44 px ≈ 1.2° at 1.4 m); running text and values use `FS.body` (48 px), names `FS.title` (56 px).
+ * Interactive widgets are at least 44 mm (≈ 65 px) wide and tall (WidgetList.add enforces it as a safety net).
+ */
 
 /** Content area below the header (canvas pixels). */
 const LEFT = 64;
 const RIGHT = 1984;
 const TOP = 186;
+const BOTTOM = 1244;
+
+/** A seek to the very end finishes the track; stay this far inside it. */
+const SEEK_END_MARGIN = 0.25;
 
 const KIND_LABEL: Record<SourceKind, string> = {
   file: 'LOCAL FILE',
@@ -24,12 +34,23 @@ const KIND_LABEL: Record<SourceKind, string> = {
 // shared bits
 // ---------------------------------------------------------------------------------------------
 
-function sectionLabel(env: TabEnv, text: string, x: number, y: number, align: CanvasTextAlign = 'left'): void {
-  drawText(env.ctx, text, x, y, 36, COLOR.textFaint, { weight: 800, spacing: 4, align });
+/** Uppercase caption; `y` is the baseline. Returns the rendered width. */
+function sectionLabel(env: TabEnv, text: string, x: number, y: number, align: CanvasTextAlign = 'left'): number {
+  const { ctx } = env;
+  ctx.font = font(FS.label, 800);
+  ctx.letterSpacing = '3px';
+  const w = Math.ceil(ctx.measureText(text).width);
+  ctx.letterSpacing = '0px';
+  drawText(ctx, text, x, y, FS.label, COLOR.textFaint, { weight: 800, spacing: 3, align });
+  return w;
 }
 
 function hit(env: TabEnv, key: string, x: number, y: number, w: number, h: number, r: number, click: () => void): void {
   env.widgets.add({ key, x, y, w, h, r, click });
+}
+
+function liveLabel(env: TabEnv, o: Omit<LiveLabel, 'size' | 'weight'> & { size?: number; weight?: number }): void {
+  env.live.labels.push({ size: FS.label, weight: 700, ...o });
 }
 
 interface CircleBtn {
@@ -76,12 +97,16 @@ function circleButton(env: TabEnv, o: CircleBtn): void {
 const lastCommitAt = new Map<string, number>();
 const lastCommitValue = new Map<string, number>();
 
+/**
+ * Draws the groove, registers the GPU overlay for fill + knob and the drag widget. `read` returns the current
+ * store value; while dragging (or just after) the held value wins. Nothing here needs a canvas redraw per drag step.
+ */
 function slider(
   env: TabEnv, key: string, x: number, cy: number, w: number,
-  value: number, min: number, max: number, step: number, commit: (v: number) => void,
-): number {
-  const shown = env.hold(key) ?? value;
-  drawSlider(env.ctx, x, cy, w, (shown - min) / (max - min), env.accent);
+  read: () => number, min: number, max: number, step: number, commit: (v: number) => void,
+): void {
+  drawSliderTrack(env.ctx, x, cy, w);
+  env.live.sliders.push({ x, cy, w, value: () => ((env.hold(key) ?? read()) - min) / (max - min) });
   const send = (v: number): void => {
     lastCommitAt.set(key, performance.now());
     lastCommitValue.set(key, v);
@@ -96,14 +121,13 @@ function slider(
         env.setHold(key, v, 450);
         if (lastCommitValue.get(key) !== v) send(v);
         lastCommitValue.delete(key);
+        env.invalidate();
       } else {
         env.setHold(key, v, Infinity);
         if (phase === 'start' || (performance.now() - (lastCommitAt.get(key) ?? 0) > 45 && lastCommitValue.get(key) !== v)) send(v);
       }
-      env.invalidate();
     },
   });
-  return shown;
 }
 
 function drawEqGlyph(env: TabEnv, cx: number, cy: number, color: string): void {
@@ -150,24 +174,24 @@ export function drawPlayer(env: TabEnv): void {
   const LW = 950;
 
   // ---- now playing --------------------------------------------------------------------------
-  const thS = 340;
+  const thS = 312;
   drawThumb(env, track, LEFT, TOP + 4, thS);
-  const tx = LEFT + thS + 44;
+  const tx = LEFT + thS + 40;
   const tw = LEFT + LW - tx;
-  let ty = TOP + 56;
+  let ty = TOP + 58;
   if (track) {
-    ctx.font = font(56, 800);
-    const lines = wrapText(ctx, track.title || 'Untitled', tw, 3);
-    lines.forEach((ln, i) => drawText(ctx, ln, tx, ty + i * 66, 56, COLOR.text, { weight: 800 }));
-    ty += lines.length * 66 + 4;
+    ctx.font = font(FS.title, 800);
+    const lines = wrapText(ctx, track.title || 'Untitled', tw, 2);
+    lines.forEach((ln, i) => drawText(ctx, ln, tx, ty + i * 66, FS.title, COLOR.text, { weight: 800 }));
+    ty += lines.length * 66 + 6;
     if (track.artist) {
-      ctx.font = font(42, 600);
-      drawText(ctx, fitText(ctx, track.artist, tw), tx, ty, 42, COLOR.textDim, { weight: 600 });
+      ctx.font = font(FS.body, 600);
+      drawText(ctx, fitText(ctx, track.artist, tw), tx, ty, FS.body, COLOR.textDim, { weight: 600 });
     }
   } else {
-    drawText(ctx, 'Nothing playing', tx, ty, 56, COLOR.text, { weight: 800 });
-    ctx.font = font(42, 600);
-    drawText(ctx, fitText(ctx, 'Open Sources to start', tw), tx, ty + 66, 42, COLOR.textDim, { weight: 600 });
+    drawText(ctx, 'Nothing playing', tx, ty, FS.title, COLOR.text, { weight: 800 });
+    ctx.font = font(FS.body, 600);
+    drawText(ctx, fitText(ctx, 'Open Sources to start', tw), tx, ty + 66, FS.body, COLOR.textDim, { weight: 600 });
   }
   // status pill (source kind / loading / error)
   {
@@ -175,29 +199,40 @@ export function drawPlayer(env: TabEnv): void {
     let col: string = a.mainCss;
     if (pb.status === 'loading') { text = 'LOADING…'; col = COLOR.warn; }
     else if (pb.status === 'error') { text = pb.message ? pb.message : 'ERROR'; col = COLOR.bad; }
-    ctx.font = font(36, 800);
+    ctx.font = font(FS.label, 800);
     ctx.letterSpacing = '3px';
     const label = fitText(ctx, text, tw - 56);
     const pw = Math.ceil(ctx.measureText(label).width) + 56;
     ctx.letterSpacing = '0px';
-    const py = TOP + 4 + thS - 62;
-    fillRound(ctx, tx, py, pw, 62, 31, 'rgba(255,255,255,0.07)');
-    strokeRound(ctx, tx + 1.5, py + 1.5, pw - 3, 59, 30, col, 2.5);
-    drawText(ctx, label, tx + 28, py + 31, 36, col, { weight: 800, spacing: 3, baseline: 'middle' });
+    const ph = 64;
+    const py = TOP + 4 + thS - ph;
+    fillRound(ctx, tx, py, pw, ph, ph / 2, 'rgba(255,255,255,0.07)');
+    strokeRound(ctx, tx + 1.5, py + 1.5, pw - 3, ph - 3, ph / 2 - 1, col, 2.5);
+    drawText(ctx, label, tx + 28, py + ph / 2 + 2, FS.label, col, { weight: 800, spacing: 3, baseline: 'middle' });
   }
 
-  // ---- progress -----------------------------------------------------------------------------
-  const barX = 196;
-  const barW = 688;
-  const barY = 614;
+  // ---- progress (fill, knob and the elapsed-time read-out are live overlays) -----------------
+  const barX = 250;
+  const barW = 584;
+  const barY = 570;
   const dur = pb.duration;
   const seekable = !!track && track.kind !== 'mic' && Number.isFinite(dur) && dur > 0;
-  const heldSeek = env.hold('seek');
-  const frac = seekable ? (heldSeek ?? clamp(env.time / dur, 0, 1)) : 0;
-  drawSlider(ctx, barX, barY, barW, frac, a, !seekable);
-  const shownTime = heldSeek !== undefined && seekable ? heldSeek * dur : env.time;
-  drawText(ctx, !track ? '–:––' : track.kind === 'mic' ? 'LIVE' : formatTime(shownTime), LEFT, barY + 2, 40, COLOR.textDim, { weight: 700, baseline: 'middle' });
-  drawText(ctx, seekable ? formatTime(dur) : '–:––', LEFT + LW, barY + 2, 40, COLOR.textDim, { weight: 700, align: 'right', baseline: 'middle' });
+  drawSliderTrack(ctx, barX, barY, barW);
+  env.live.sliders.push({
+    x: barX, cy: barY, w: barW, disabled: !seekable,
+    value: () => (seekable ? (env.hold('seek') ?? clamp(env.playhead() / dur, 0, 1)) : 0),
+  });
+  liveLabel(env, {
+    x: LEFT, cy: barY, align: 'left', color: COLOR.textDim,
+    sig: () => {
+      if (!track) return -1;
+      if (track.kind === 'mic') return -2;
+      const held = env.hold('seek');
+      return Math.floor(held !== undefined && seekable ? held * dur : env.playhead());
+    },
+    text: (n) => (n === -1 ? '–:––' : n === -2 ? 'LIVE' : formatTime(n)),
+  });
+  drawText(ctx, seekable ? formatTime(dur) : '–:––', LEFT + LW, barY + 2, FS.label, COLOR.textDim, { weight: 700, align: 'right', baseline: 'middle' });
   if (seekable) {
     env.widgets.add({
       key: 'seek', x: barX - 36, y: barY - 50, w: barW + 72, h: 100, r: 32,
@@ -205,89 +240,93 @@ export function drawPlayer(env: TabEnv): void {
         const f = clamp((px - barX) / barW, 0, 1);
         if (phase === 'end') {
           env.setHold('seek', f, 700);
-          act.seek(f * dur);
+          act.seek(Math.min(f * dur, Math.max(0, dur - SEEK_END_MARGIN)));
+          env.invalidate();
         } else {
           env.setHold('seek', f, Infinity);
         }
-        env.invalidate();
       },
     });
   }
 
   // ---- transport ----------------------------------------------------------------------------
   const cx = LEFT + LW / 2;
-  const ty0 = 752;
+  const ty0 = 724;
   const can = queue.length > 0 || !!track;
-  circleButton(env, { key: 'shuffle', cx: cx - 430, cy: ty0, r: 48, icon: 'shuffle', active: pb.shuffle, click: () => act.setShuffle(!pb.shuffle) });
-  circleButton(env, { key: 'back10', cx: cx - 290, cy: ty0, r: 54, seek: -1, disabled: !seekable, click: () => act.seekBy(-10) });
-  circleButton(env, { key: 'prev', cx: cx - 160, cy: ty0, r: 56, icon: 'prev', disabled: !can, click: () => act.prev() });
-  circleButton(env, { key: 'toggle', cx, cy: ty0, r: 84, icon: pb.playing ? 'pause' : 'play', primary: true, disabled: !can, click: () => act.toggle() });
-  circleButton(env, { key: 'next', cx: cx + 160, cy: ty0, r: 56, icon: 'next', disabled: !can, click: () => act.next() });
-  circleButton(env, { key: 'fwd10', cx: cx + 290, cy: ty0, r: 54, seek: 1, disabled: !seekable, click: () => act.seekBy(10) });
+  circleButton(env, { key: 'shuffle', cx: cx - 420, cy: ty0, r: 46, icon: 'shuffle', active: pb.shuffle, click: () => act.setShuffle(!pb.shuffle) });
+  circleButton(env, { key: 'back10', cx: cx - 286, cy: ty0, r: 58, seek: -1, disabled: !seekable, click: () => act.seekBy(-10) });
+  circleButton(env, { key: 'prev', cx: cx - 156, cy: ty0, r: 54, icon: 'prev', disabled: !can, click: () => act.prev() });
+  circleButton(env, { key: 'toggle', cx, cy: ty0, r: 80, icon: pb.playing ? 'pause' : 'play', primary: true, disabled: !can, click: () => act.toggle() });
+  circleButton(env, { key: 'next', cx: cx + 156, cy: ty0, r: 54, icon: 'next', disabled: !can, click: () => act.next() });
+  circleButton(env, { key: 'fwd10', cx: cx + 286, cy: ty0, r: 58, seek: 1, disabled: !seekable, click: () => act.seekBy(10) });
   const nextRepeat = pb.repeat === 'off' ? 'all' : pb.repeat === 'all' ? 'one' : 'off';
   circleButton(env, {
-    key: 'repeat', cx: cx + 430, cy: ty0, r: 48, icon: pb.repeat === 'one' ? 'repeatOne' : 'repeat',
+    key: 'repeat', cx: cx + 420, cy: ty0, r: 46, icon: pb.repeat === 'one' ? 'repeatOne' : 'repeat',
     active: pb.repeat !== 'off', click: () => act.setRepeat(nextRepeat),
   });
 
   // ---- volume -------------------------------------------------------------------------------
-  const volY = 904;
+  const volY = 890;
   const vol = env.hold('volume') ?? pb.volume;
   if (pb.volume > 0.01) env.local.lastVolume = pb.volume;
   circleButton(env, {
-    key: 'mute', cx: LEFT + 44, cy: volY, r: 44, icon: vol <= 0.01 ? 'volumeMute' : 'volume',
+    key: 'mute', cx: LEFT + 46, cy: volY, r: 46, icon: vol <= 0.01 ? 'volumeMute' : 'volume',
     click: () => act.setVolume(pb.volume > 0.01 ? 0 : env.local.lastVolume || 0.6),
   });
-  slider(env, 'volume', 196, volY, barW, pb.volume, 0, 1, 0.01, (v) => act.setVolume(v));
-  drawText(ctx, `${Math.round(vol * 100)}%`, LEFT + LW, volY + 2, 40, COLOR.textDim, { weight: 700, align: 'right', baseline: 'middle' });
+  slider(env, 'volume', barX, volY, barW, () => env.state.playback.volume, 0, 1, 0.01, (v) => act.setVolume(v));
+  liveLabel(env, {
+    x: LEFT + LW, cy: volY, align: 'right', color: COLOR.textDim,
+    sig: () => Math.round((env.hold('volume') ?? env.state.playback.volume) * 100),
+    text: (n) => `${n}%`,
+  });
 
   // ---- scene / palette quick switch ---------------------------------------------------------
-  const cy0 = 988;
-  const cH = 248;
-  drawCard(env.ctx, LEFT, cy0, LW, cH);
-  sectionLabel(env, 'SCENE', LEFT + 40, cy0 + 62);
+  const cy0 = 982;
+  const cH = BOTTOM - cy0;
+  drawCard(ctx, LEFT, cy0, LW, cH);
+  sectionLabel(env, 'SCENE', LEFT + 40, cy0 + 66);
   const presetIdx = Math.max(0, s.presets.findIndex((p) => p.id === s.preset));
   const cur = s.presets[presetIdx];
-  circleButton(env, { key: 'qs-prev', cx: LEFT + 92, cy: cy0 + 130, r: 40, icon: 'chevronLeft', click: () => act.prevPreset() });
-  circleButton(env, { key: 'qs-next', cx: LEFT + LW - 92, cy: cy0 + 130, r: 40, icon: 'chevronRight', click: () => act.nextPreset() });
+  circleButton(env, { key: 'qs-prev', cx: LEFT + 92, cy: cy0 + 134, r: 40, icon: 'chevronLeft', click: () => act.prevPreset() });
+  circleButton(env, { key: 'qs-next', cx: LEFT + LW - 92, cy: cy0 + 134, r: 40, icon: 'chevronRight', click: () => act.nextPreset() });
   ctx.font = font(52, 800);
-  drawText(ctx, fitText(ctx, cur ? cur.name : '–', LW - 300), LEFT + LW / 2, cy0 + 130, 52, COLOR.text, { weight: 800, align: 'center', baseline: 'middle' });
+  drawText(ctx, fitText(ctx, cur ? cur.name : '–', LW - 330), LEFT + LW / 2, cy0 + 134, 52, COLOR.text, { weight: 800, align: 'center', baseline: 'middle' });
   if (s.presets.length > 0) {
-    drawText(ctx, `${presetIdx + 1} / ${s.presets.length}`, LEFT + LW - 40, cy0 + 62, 36, COLOR.textFaint, { weight: 700, align: 'right' });
+    drawText(ctx, `${presetIdx + 1} / ${s.presets.length}`, LEFT + LW - 40, cy0 + 66, FS.label, COLOR.textDim, { weight: 700, align: 'right' });
   }
-  // palette dots
-  const dotR = 27;
-  const dotGap = 22;
+  // palette dots: 60 px discs on a 74 px pitch, so every hit rect is 74 px ≈ 50 mm
+  const dotR = 30;
+  const pitch = 74;
   const n = s.palettes.length;
-  const rowW = n * dotR * 2 + (n - 1) * dotGap;
-  let dx = LEFT + LW / 2 - rowW / 2 + dotR;
-  const dy = cy0 + 200;
+  const dy = cy0 + 210;
+  let dx = LEFT + LW / 2 - (n * pitch) / 2 + pitch / 2;
   for (const p of s.palettes) {
     const g = ctx.createLinearGradient(dx - dotR, dy - dotR, dx + dotR, dy + dotR);
     p.stops.forEach((c, i) => g.addColorStop(i / Math.max(1, p.stops.length - 1), c));
     circle(ctx, dx, dy, dotR, g);
     if (p.id === s.palette) {
       ctx.beginPath();
-      ctx.arc(dx, dy, dotR + 7, 0, Math.PI * 2);
+      ctx.arc(dx, dy, dotR + 8, 0, Math.PI * 2);
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 4;
       ctx.stroke();
     }
-    hit(env, `pal-dot-${p.id}`, dx - dotR - 8, dy - dotR - 8, (dotR + 8) * 2, (dotR + 8) * 2, dotR + 8, () => act.setPalette(p.id));
-    dx += dotR * 2 + dotGap;
+    hit(env, `pal-dot-${p.id}`, dx - pitch / 2, dy - pitch / 2, pitch, pitch, pitch / 2, () => act.setPalette(p.id));
+    dx += pitch;
   }
 
   // ---- queue --------------------------------------------------------------------------------
   const QX = 1070;
   const QW = RIGHT - QX;
   const ROWS = 6;
-  const RH = 132;
-  const GAP = 12;
-  const RY = 270;
+  const RH = 140;
+  const GAP = 10;
+  const RY = 276;
   const total = queue.length;
-  sectionLabel(env, 'QUEUE', QX, TOP + 50);
+  const headY = TOP + 36;
+  const qlw = sectionLabel(env, 'QUEUE', QX, headY + 15);
   if (total > 0) {
-    drawText(ctx, `${total} ${total === 1 ? 'track' : 'tracks'}`, QX + 168, TOP + 50, 36, COLOR.textDim, { weight: 700 });
+    drawText(ctx, `${total} ${total === 1 ? 'track' : 'tracks'}`, QX + qlw + 24, headY + 15, FS.label, COLOR.textDim, { weight: 700 });
   }
   if (pb.index !== env.local.lastIndex) {
     env.local.lastIndex = pb.index;
@@ -296,30 +335,32 @@ export function drawPlayer(env: TabEnv): void {
   const maxTop = Math.max(0, total - ROWS);
   const top = clamp(env.local.queueTop ?? pb.index - 2, 0, maxTop);
   if (total > ROWS) {
-    circleButton(env, { key: 'q-up', cx: QX + QW - 250, cy: TOP + 40, r: 32, icon: 'chevronUp', disabled: top <= 0, click: () => { env.local.queueTop = Math.max(0, top - 2); env.invalidate(); } });
-    circleButton(env, { key: 'q-down', cx: QX + QW - 170, cy: TOP + 40, r: 32, icon: 'chevronDown', disabled: top >= maxTop, click: () => { env.local.queueTop = Math.min(maxTop, top + 2); env.invalidate(); } });
+    circleButton(env, { key: 'q-up', cx: QX + QW - 330, cy: headY, r: 34, icon: 'chevronUp', disabled: top <= 0, click: () => { env.local.queueTop = Math.max(0, top - 2); env.invalidate(); } });
+    circleButton(env, { key: 'q-down', cx: QX + QW - 242, cy: headY, r: 34, icon: 'chevronDown', disabled: top >= maxTop, click: () => { env.local.queueTop = Math.min(maxTop, top + 2); env.invalidate(); } });
   }
   if (total > 0) {
-    const bw = 120;
+    const bw = 168;
+    const bh = 72;
     const bx = QX + QW - bw;
-    fillRound(ctx, bx, TOP + 8, bw, 64, 32, 'rgba(255,255,255,0.07)');
-    drawText(ctx, 'Clear', bx + bw / 2, TOP + 41, 36, COLOR.textDim, { weight: 700, align: 'center', baseline: 'middle' });
-    hit(env, 'q-clear', bx, TOP + 8, bw, 64, 32, () => act.clearQueue());
+    fillRound(ctx, bx, headY - bh / 2, bw, bh, bh / 2, 'rgba(255,255,255,0.09)');
+    strokeRound(ctx, bx + 1.5, headY - bh / 2 + 1.5, bw - 3, bh - 3, bh / 2 - 1, 'rgba(255,255,255,0.16)', 2);
+    drawText(ctx, 'Clear', bx + bw / 2, headY + 2, FS.label, COLOR.text, { weight: 700, align: 'center', baseline: 'middle' });
+    hit(env, 'q-clear', bx, headY - bh / 2, bw, bh, bh / 2, () => act.clearQueue());
   }
 
   if (total === 0) {
-    drawCard(ctx, QX, RY - 4, QW, 880, 30);
-    drawIcon(ctx, 'note', QX + QW / 2, RY + 250, 150, 'rgba(255,255,255,0.22)');
-    ctx.font = font(50, 800);
+    drawCard(ctx, QX, RY - 4, QW, BOTTOM - RY + 4, 30);
+    drawIcon(ctx, 'note', QX + QW / 2, RY + 250, 160, 'rgba(255,255,255,0.22)');
+    ctx.font = font(52, 800);
     const lines = wrapText(ctx, 'Nothing playing — open Sources', QW - 140, 2);
-    lines.forEach((ln, i) => drawText(ctx, ln, QX + QW / 2, RY + 410 + i * 62, 50, COLOR.text, { weight: 800, align: 'center' }));
-    const bw = 440;
-    const bh = 104;
+    lines.forEach((ln, i) => drawText(ctx, ln, QX + QW / 2, RY + 436 + i * 64, 52, COLOR.text, { weight: 800, align: 'center' }));
+    const bw = 480;
+    const bh = 112;
     const bx = QX + (QW - bw) / 2;
-    const by = RY + 560;
-    fillRound(ctx, bx, by, bw, bh, 52, hGradient(ctx, bx, bx + bw, a.mainCss, a.altCss));
-    drawText(ctx, 'Open Sources', bx + bw / 2, by + bh / 2 + 2, 44, a.ink, { weight: 800, align: 'center', baseline: 'middle' });
-    hit(env, 'open-sources', bx, by, bw, bh, 52, () => act.setTab('sources'));
+    const by = RY + 580;
+    fillRound(ctx, bx, by, bw, bh, bh / 2, hGradient(ctx, bx, bx + bw, a.mainCss, a.altCss));
+    drawText(ctx, 'Open Sources', bx + bw / 2, by + bh / 2 + 2, FS.body, a.ink, { weight: 800, align: 'center', baseline: 'middle' });
+    hit(env, 'open-sources', bx, by, bw, bh, bh / 2, () => act.setTab('sources'));
     return;
   }
 
@@ -332,24 +373,24 @@ export function drawPlayer(env: TabEnv): void {
     strokeRound(ctx, QX + 1, y + 1, QW - 2, RH - 2, 25, current ? a.glow : COLOR.stroke, 2.5);
     if (current) fillRound(ctx, QX + 14, y + 26, 8, RH - 52, 4, a.mainCss);
     const midY = y + RH / 2;
-    if (current && pb.playing) drawEqGlyph(env, QX + 70, midY, a.mainCss);
-    else drawText(ctx, String(i + 1), QX + 70, midY + 2, 40, current ? a.mainCss : COLOR.textFaint, { weight: 800, align: 'center', baseline: 'middle' });
-    const textX = QX + 128;
-    const textW = QW - 128 - 120;
-    ctx.font = font(44, 700);
-    drawText(ctx, fitText(ctx, t.title || 'Untitled', textW), textX, midY - 8, 44, current ? COLOR.text : '#e1e5fa', { weight: 700 });
+    if (current && pb.playing) drawEqGlyph(env, QX + 64, midY, a.mainCss);
+    else drawText(ctx, String(i + 1), QX + 64, midY + 2, FS.label, current ? a.mainCss : COLOR.textFaint, { weight: 800, align: 'center', baseline: 'middle' });
+    const textX = QX + 116;
+    const textW = QW - 116 - 124;
+    ctx.font = font(FS.body, 700);
+    drawText(ctx, fitText(ctx, t.title || 'Untitled', textW), textX, y + 62, FS.body, current ? COLOR.text : '#e1e5fa', { weight: 700 });
     const sub = [t.artist, KIND_LABEL[t.kind].toLowerCase()].filter(Boolean).join('  ·  ');
-    ctx.font = font(36, 600);
-    const durW = t.duration ? Math.ceil(ctx.measureText(formatTime(t.duration)).width) + 24 : 0;
-    if (t.duration) drawText(ctx, formatTime(t.duration), textX + textW, midY + 44, 36, COLOR.textDim, { weight: 600, align: 'right' });
-    ctx.font = font(36, 500);
-    drawText(ctx, fitText(ctx, sub, textW - durW), textX, midY + 44, 36, COLOR.textFaint, { weight: 500 });
-    drawIcon(ctx, 'close', QX + QW - 62, midY, 40, COLOR.textDim);
-    hit(env, `q-row-${i}`, QX, y, QW - 118, RH, 26, () => (current ? act.toggle() : act.play(i)));
-    hit(env, `q-del-${i}`, QX + QW - 118, y + 14, 104, RH - 28, 26, () => act.removeTrack(i));
+    ctx.font = font(FS.label, 600);
+    const durText = t.duration ? formatTime(t.duration) : '';
+    const durW = durText ? Math.ceil(ctx.measureText(durText).width) + 24 : 0;
+    if (durText) drawText(ctx, durText, textX + textW, y + 116, FS.label, COLOR.textDim, { weight: 600, align: 'right' });
+    drawText(ctx, fitText(ctx, sub, textW - durW), textX, y + 116, FS.label, COLOR.textFaint, { weight: 600 });
+    drawIcon(ctx, 'close', QX + QW - 60, midY, 44, COLOR.textDim);
+    hit(env, `q-row-${i}`, QX, y, QW - 120, RH, 26, () => (current ? act.toggle() : act.play(i)));
+    hit(env, `q-del-${i}`, QX + QW - 120, y + 14, 106, RH - 28, 26, () => act.removeTrack(i));
   }
   if (total > ROWS) {
-    drawText(ctx, `${top + 1}–${Math.min(total, top + ROWS)} of ${total}`, QX + QW / 2, RY + ROWS * (RH + GAP) + 44, 36, COLOR.textFaint, { weight: 700, align: 'center' });
+    drawText(ctx, `${top + 1}–${Math.min(total, top + ROWS)} of ${total}`, QX + QW / 2, RY + ROWS * (RH + GAP) + 38, FS.label, COLOR.textDim, { weight: 700, align: 'center' });
   }
 }
 
@@ -364,22 +405,28 @@ export function drawScenes(env: TabEnv): void {
   const activeIdx = Math.max(0, s.presets.findIndex((p) => p.id === s.preset));
   const page = clamp(env.local.scenePage ?? Math.floor(activeIdx / per), 0, pages - 1);
 
-  sectionLabel(env, 'SCENES', LEFT, TOP + 30);
+  // left column: scene tiles, description of the active scene, palettes. right column: tuning
+  const COLW = 1320;
+  const RX = 1424;
+  const RW = RIGHT - RX;
+
+  sectionLabel(env, 'SCENES', LEFT, TOP + 36);
   if (pages > 1) {
-    drawText(ctx, `${page + 1} / ${pages}`, RIGHT - 130, TOP + 30, 36, COLOR.textDim, { weight: 700, align: 'right' });
-    circleButton(env, { key: 'sc-prev', cx: RIGHT - 92, cy: TOP + 16, r: 30, icon: 'chevronLeft', disabled: page <= 0, click: () => { env.local.scenePage = page - 1; env.invalidate(); } });
-    circleButton(env, { key: 'sc-next', cx: RIGHT - 30, cy: TOP + 16, r: 30, icon: 'chevronRight', disabled: page >= pages - 1, click: () => { env.local.scenePage = page + 1; env.invalidate(); } });
+    const nextX = LEFT + COLW - 40;
+    drawText(ctx, `${page + 1} / ${pages}`, nextX - 126, TOP + 36, FS.label, COLOR.textDim, { weight: 700, align: 'right' });
+    circleButton(env, { key: 'sc-prev', cx: nextX - 84, cy: TOP + 22, r: 32, icon: 'chevronLeft', disabled: page <= 0, click: () => { env.local.scenePage = page - 1; env.invalidate(); } });
+    circleButton(env, { key: 'sc-next', cx: nextX, cy: TOP + 22, r: 32, icon: 'chevronRight', disabled: page >= pages - 1, click: () => { env.local.scenePage = page + 1; env.invalidate(); } });
   }
-  const TW = 624;
-  const TH = 200;
-  const G = 24;
-  const y0 = TOP + 56;
+  const TW = (COLW - 20) / 2;
+  const TH = 152;
+  const G = 18;
+  const y0 = TOP + 72;
   for (let k = 0; k < per; k++) {
     const idx = page * per + k;
     const p = s.presets[idx];
     if (!p) break;
-    const x = LEFT + (k % 3) * (TW + G);
-    const y = y0 + Math.floor(k / 3) * (TH + G);
+    const x = LEFT + (k % 2) * (TW + 20);
+    const y = y0 + Math.floor(k / 2) * (TH + G);
     const active = p.id === s.preset;
     if (active) {
       const g = ctx.createLinearGradient(x, y, x + TW, y + TH);
@@ -387,65 +434,82 @@ export function drawScenes(env: TabEnv): void {
       g.addColorStop(1, rgba(a.alt, 0.12));
       fillRound(ctx, x, y, TW, TH, 28, g);
       strokeRound(ctx, x + 2, y + 2, TW - 4, TH - 4, 27, hGradient(ctx, x, x + TW, a.mainCss, a.altCss), 5);
+      circle(ctx, x + TW - 52, y + TH / 2, 26, hGradient(ctx, x + TW - 78, x + TW - 26, a.mainCss, a.altCss));
+      drawIcon(ctx, 'check', x + TW - 52, y + TH / 2, 34, a.ink);
     } else {
       drawCard(ctx, x, y, TW, TH, 28);
+      drawText(ctx, String(idx + 1).padStart(2, '0'), x + TW - 32, y + TH / 2 + 2, FS.label, COLOR.textFaint, { weight: 800, align: 'right', baseline: 'middle' });
     }
-    ctx.font = font(48, 800);
-    drawText(ctx, fitText(ctx, p.name, TW - 60 - (active ? 180 : 70)), x + 32, y + 66, 48, COLOR.text, { weight: 800 });
-    if (active) drawText(ctx, 'ACTIVE', x + TW - 32, y + 62, 36, a.mainCss, { weight: 800, align: 'right', spacing: 3 });
-    else drawText(ctx, String(idx + 1).padStart(2, '0'), x + TW - 32, y + 62, 36, COLOR.textFaint, { weight: 800, align: 'right' });
-    ctx.font = font(36, 500);
-    wrapText(ctx, p.description, TW - 64, 2).forEach((ln, i) => drawText(ctx, ln, x + 32, y + 118 + i * 42, 36, COLOR.textDim, { weight: 500 }));
+    ctx.font = font(FS.body, 700);
+    drawText(ctx, fitText(ctx, p.name, TW - 32 - 100), x + 32, y + TH / 2 + 2, FS.body, COLOR.text, { weight: 700, baseline: 'middle' });
     hit(env, `preset-${p.id}`, x, y, TW, TH, 28, () => act.setPreset(p.id));
   }
 
+  // what the active scene is
+  const capY = y0 + 3 * TH + 2 * G + G;
+  const capH = 132;
+  const activePreset = s.presets[activeIdx];
+  drawCard(ctx, LEFT, capY, COLW, capH, 26);
+  if (activePreset) {
+    fillRound(ctx, LEFT + 16, capY + 24, 6, capH - 48, 3, a.mainCss);
+    ctx.font = font(FS.body, 600);
+    const lines = wrapText(ctx, activePreset.description, COLW - 96, 2);
+    const first = capY + (capH - lines.length * 56) / 2 + 42;
+    lines.forEach((ln, i) => drawText(ctx, ln, LEFT + 44, first + i * 56, FS.body, COLOR.textDim, { weight: 600 }));
+  }
+
   // palettes
-  const perRow = 7;
+  const perRow = 4;
+  const chipGap = 14;
   const chipH = 104;
-  const rows = Math.max(1, Math.ceil(s.palettes.length / perRow));
-  const palLabelY = y0 + 2 * (TH + G) + 36;
+  const palLabelY = capY + capH + 62;
   const curPal = s.palettes.find((p) => p.id === s.palette);
   sectionLabel(env, 'PALETTE', LEFT, palLabelY);
-  if (curPal) drawText(ctx, curPal.name, RIGHT, palLabelY, 36, COLOR.textDim, { weight: 700, align: 'right' });
-  const chipW = Math.floor((RIGHT - LEFT - (perRow - 1) * 14) / perRow);
-  const cy0 = palLabelY + 28;
+  if (curPal) drawText(ctx, curPal.name, LEFT + COLW, palLabelY, FS.body, COLOR.textDim, { weight: 700, align: 'right' });
+  const chipW = Math.floor((COLW - (perRow - 1) * chipGap) / perRow);
+  const cy0 = palLabelY + 26;
   s.palettes.forEach((p, i) => {
-    const x = LEFT + (i % perRow) * (chipW + 14);
-    const y = cy0 + Math.floor(i / perRow) * (chipH + 20);
+    const x = LEFT + (i % perRow) * (chipW + chipGap);
+    const y = cy0 + Math.floor(i / perRow) * (chipH + chipGap);
     drawPaletteChip(ctx, x, y, chipW, chipH, p.stops, p.name, p.id === s.palette, a);
-    hit(env, `palette-${p.id}`, x - 6, y - 6, chipW + 12, chipH + 12, 26, () => act.setPalette(p.id));
+    hit(env, `palette-${p.id}`, x - 4, y - 4, chipW + 8, chipH + 8, 28, () => act.setPalette(p.id));
   });
 
-  // sliders + toggles
-  const sy = cy0 + rows * (chipH + 20) + 36;
+  // sliders (fill, knob and value are live overlays)
+  sectionLabel(env, 'TUNING', RX, TOP + 36);
   const sliders: { key: string; label: string; min: number; max: number; k: 'intensity' | 'speed' | 'glow' }[] = [
     { key: 'intensity', label: 'Intensity', min: 0, max: 2, k: 'intensity' },
     { key: 'speed', label: 'Speed', min: 0, max: 2, k: 'speed' },
     { key: 'glow', label: 'Glow', min: 0, max: 1, k: 'glow' },
   ];
   sliders.forEach((sl, i) => {
-    const cy = sy + 36 + i * 100;
-    drawText(ctx, sl.label, LEFT, cy + 2, 44, COLOR.text, { weight: 700, baseline: 'middle' });
-    const v = slider(env, `param-${sl.key}`, 330, cy, 800, s.params[sl.k], sl.min, sl.max, 0.05, (val) => act.setParam(sl.k, val));
-    drawText(ctx, v.toFixed(2), 1160 + 90, cy + 2, 44, COLOR.textDim, { weight: 700, align: 'right', baseline: 'middle' });
+    const top = y0 + i * 156;
+    drawText(ctx, sl.label, RX, top + 32, FS.body, COLOR.text, { weight: 700, baseline: 'middle' });
+    liveLabel(env, {
+      x: RIGHT, cy: top + 32, align: 'right', size: FS.body, color: COLOR.textDim,
+      sig: () => Math.round((env.hold(`param-${sl.key}`) ?? env.state.params[sl.k]) * 100),
+      text: (n) => (n / 100).toFixed(2),
+    });
+    slider(env, `param-${sl.key}`, RX + 40, top + 106, RW - 80, () => env.state.params[sl.k], sl.min, sl.max, 0.05, (val) => act.setParam(sl.k, val));
   });
 
-  const tx = 1400;
-  const tw = RIGHT - tx;
+  // toggles
+  const tgY = y0 + 3 * 156 + 6;
+  const tgH = 104;
   const toggles: { key: string; label: string; on: boolean; click: () => void }[] = [
     { key: 'autocycle', label: 'Auto-cycle', on: s.autoCycle, click: () => act.setAutoCycle(!s.autoCycle) },
     { key: 'background', label: 'Background', on: s.params.background, click: () => act.setParam('background', !s.params.background) },
   ];
   toggles.forEach((t, i) => {
-    const cy = sy + 36 + i * 100;
-    drawCard(ctx, tx, cy - 44, tw, 88, 26);
-    drawText(ctx, t.label, tx + 32, cy + 2, 44, COLOR.text, { weight: 700, baseline: 'middle' });
-    drawSwitch(ctx, tx + tw - 112 - 28, cy, t.on, a);
-    hit(env, `toggle-${t.key}`, tx, cy - 44, tw, 88, 26, t.click);
+    const ty = tgY + i * (tgH + 16);
+    drawCard(ctx, RX, ty, RW, tgH, 26);
+    drawText(ctx, t.label, RX + 28, ty + tgH / 2 + 2, FS.body, COLOR.text, { weight: 700, baseline: 'middle' });
+    drawSwitch(ctx, RX + RW - 112 - 24, ty + tgH / 2, t.on, a);
+    hit(env, `toggle-${t.key}`, RX, ty, RW, tgH, 26, t.click);
   });
-  ctx.font = font(36, 500);
+  ctx.font = font(FS.label, 600);
   const note = s.autoCycle ? `Next scene every ${s.cycleSeconds} s` : 'Switch scenes on a timer';
-  drawText(ctx, fitText(ctx, note, tw), tx + 8, sy + 36 + 2 * 100 + 4, 36, COLOR.textFaint, { weight: 500, baseline: 'middle' });
+  drawText(ctx, fitText(ctx, note, RW - 16), RX + 8, tgY + 2 * (tgH + 16) + 36, FS.label, COLOR.textFaint, { weight: 600, baseline: 'middle' });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -470,84 +534,87 @@ export function drawSources(env: TabEnv): void {
   const { ctx, state: s, actions: act, accent: a, features } = env;
   const pb = s.playback;
   const TWID = 940;
-  const TH = 262;
+  const TH = 300;
   const micOn = pb.micEnabled;
   const silent = features.silence;
 
   // microphone tile
   bigTile(env, 'mic', LEFT, TOP, TWID, TH, micOn, () => (micOn ? act.disableMic() : act.enableMic()));
-  circle(ctx, LEFT + 110, TOP + 100, 62, micOn ? hGradient(ctx, LEFT + 48, LEFT + 172, a.mainCss, a.altCss) : 'rgba(255,255,255,0.09)');
-  drawIcon(ctx, 'mic', LEFT + 110, TOP + 100, 68, micOn ? a.ink : COLOR.text);
-  drawText(ctx, micOn ? 'Microphone on' : 'Microphone off', LEFT + 206, TOP + 88, 56, COLOR.text, { weight: 800 });
+  circle(ctx, LEFT + 104, TOP + 96, 56, micOn ? hGradient(ctx, LEFT + 48, LEFT + 160, a.mainCss, a.altCss) : 'rgba(255,255,255,0.09)');
+  drawIcon(ctx, 'mic', LEFT + 104, TOP + 96, 62, micOn ? a.ink : COLOR.text);
+  drawText(ctx, micOn ? 'Microphone on' : 'Microphone off', LEFT + 196, TOP + 88, FS.title, COLOR.text, { weight: 800 });
   const micStatus = micOn ? (silent ? 'No signal yet' : 'Listening') : 'Tap to turn on';
-  drawText(ctx, micStatus, LEFT + 206, TOP + 140, 40, micOn ? (silent ? COLOR.warn : COLOR.good) : COLOR.textDim, { weight: 600 });
-  sectionLabel(env, 'INPUT LEVEL', LEFT + 40, TOP + 202);
-  drawMeter(ctx, LEFT + 40 + 330, TOP + 178, TWID - 80 - 330, 34, features.level, 26, a);
+  drawText(ctx, micStatus, LEFT + 196, TOP + 148, FS.body, micOn ? (silent ? COLOR.warn : COLOR.good) : COLOR.textDim, { weight: 600 });
+  const lvlW = sectionLabel(env, 'LEVEL', LEFT + 40, TOP + 250);
+  const meterX = LEFT + 40 + lvlW + 28;
+  drawMeter(ctx, meterX, TOP + 220, LEFT + TWID - 40 - meterX, 40, features.level, 24, a);
 
   // demo tile
   const dx = RIGHT - TWID;
   const demoPlaying = !!pb.track && pb.track.kind === 'demo' && pb.playing;
   bigTile(env, 'demo', dx, TOP, TWID, TH, demoPlaying, () => act.startDemo());
-  circle(ctx, dx + 110, TOP + 100, 62, demoPlaying ? hGradient(ctx, dx + 48, dx + 172, a.mainCss, a.altCss) : 'rgba(255,255,255,0.09)');
-  drawIcon(ctx, demoPlaying ? 'pause' : 'play', dx + 110, TOP + 100, 68, demoPlaying ? a.ink : COLOR.text);
-  drawText(ctx, 'Demo track', dx + 206, TOP + 88, 56, COLOR.text, { weight: 800 });
-  drawText(ctx, demoPlaying ? 'Playing now' : 'Tap to start', dx + 206, TOP + 140, 40, demoPlaying ? COLOR.good : COLOR.textDim, { weight: 600 });
-  ctx.font = font(36, 500);
-  wrapText(ctx, 'Built-in synthetic music at about 124 BPM, always available offline.', TWID - 80, 2)
-    .forEach((ln, i) => drawText(ctx, ln, dx + 40, TOP + 196 + i * 42, 36, COLOR.textFaint, { weight: 500 }));
+  circle(ctx, dx + 104, TOP + 96, 56, demoPlaying ? hGradient(ctx, dx + 48, dx + 160, a.mainCss, a.altCss) : 'rgba(255,255,255,0.09)');
+  drawIcon(ctx, demoPlaying ? 'pause' : 'play', dx + 104, TOP + 96, 62, demoPlaying ? a.ink : COLOR.text);
+  drawText(ctx, 'Demo track', dx + 196, TOP + 88, FS.title, COLOR.text, { weight: 800 });
+  drawText(ctx, demoPlaying ? 'Playing now' : 'Tap to start', dx + 196, TOP + 148, FS.body, demoPlaying ? COLOR.good : COLOR.textDim, { weight: 600 });
+  ctx.font = font(FS.body, 600);
+  wrapText(ctx, 'Built-in music at about 124 BPM, works offline.', TWID - 80, 2)
+    .forEach((ln, i) => drawText(ctx, ln, dx + 40, TOP + 220 + i * 54, FS.body, COLOR.textDim, { weight: 600 }));
 
   // YouTube card
-  const yy = TOP + TH + 32;
-  const yh = 336;
+  const yy = TOP + TH + 24;
+  const yh = 304;
   drawCard(ctx, LEFT, yy, RIGHT - LEFT, yh, 30);
-  drawIcon(ctx, 'play', LEFT + 74, yy + 66, 58, '#ff4d5e');
-  sectionLabel(env, 'YOUTUBE & LINKS', LEFT + 128, yy + 78);
-  ctx.font = font(46, 700);
-  wrapText(ctx, 'Add YouTube/URL in the 2D browser window before entering VR; playback controls work here.', RIGHT - LEFT - 100, 2)
-    .forEach((ln, i) => drawText(ctx, ln, LEFT + 50, yy + 154 + i * 58, 46, COLOR.text, { weight: 700 }));
-  ctx.font = font(38, 500);
-  wrapText(ctx, 'YouTube audio is analysed through the headset microphone, so keep the sound playing and the microphone allowed.', RIGHT - LEFT - 100 - 330, 2)
-    .forEach((ln, i) => drawText(ctx, ln, LEFT + 50, yy + 272 + i * 44, 38, COLOR.textDim, { weight: 500 }));
+  drawIcon(ctx, 'play', LEFT + 74, yy + 62, 58, '#ff4d5e');
+  sectionLabel(env, 'YOUTUBE & LINKS', LEFT + 128, yy + 76);
   {
-    const bw = 300;
-    const bh = 84;
-    const bx = RIGHT - 50 - bw;
-    const by = yy + yh - 50 - bh + 10;
-    fillRound(ctx, bx, by, bw, bh, 42, 'rgba(255,255,255,0.09)');
-    strokeRound(ctx, bx + 1.5, by + 1.5, bw - 3, bh - 3, 41, a.glow, 3);
-    drawText(ctx, 'Open Player', bx + bw / 2, by + bh / 2 + 2, 40, COLOR.text, { weight: 700, align: 'center', baseline: 'middle' });
-    hit(env, 'open-player', bx, by, bw, bh, 42, () => act.setTab('player'));
+    const bw = 340;
+    const bh = 88;
+    const bx = RIGHT - 44 - bw;
+    const by = yy + 20;
+    fillRound(ctx, bx, by, bw, bh, bh / 2, 'rgba(255,255,255,0.09)');
+    strokeRound(ctx, bx + 1.5, by + 1.5, bw - 3, bh - 3, bh / 2 - 1, a.glow, 3);
+    drawText(ctx, 'Open Player', bx + bw / 2, by + bh / 2 + 2, FS.body, COLOR.text, { weight: 700, align: 'center', baseline: 'middle' });
+    hit(env, 'open-player', bx, by, bw, bh, bh / 2, () => act.setTab('player'));
   }
+  ctx.font = font(FS.body, 700);
+  wrapText(ctx, 'Add YouTube/URL in the 2D browser window before entering VR; playback controls work here.', RIGHT - LEFT - 100, 2)
+    .forEach((ln, i) => drawText(ctx, ln, LEFT + 50, yy + 164 + i * 60, FS.body, COLOR.text, { weight: 700 }));
+  ctx.font = font(FS.body, 600);
+  drawText(ctx, fitText(ctx, 'Audio is analysed through the headset microphone.', RIGHT - LEFT - 100), LEFT + 50, yy + 278, FS.body, COLOR.textDim, { weight: 600 });
 
   // status card
-  const sy = yy + yh + 32;
-  const sh = TOP + 1058 - sy;
+  const sy = yy + yh + 24;
+  const sh = BOTTOM - sy;
   drawCard(ctx, LEFT, sy, RIGHT - LEFT, sh, 30);
-  const analysis = pb.analysisInput === 'element' ? 'Direct from the audio player' : pb.analysisInput === 'mic' ? 'Microphone loop-back' : 'None yet';
+  const analysis = pb.analysisInput === 'element' ? 'Direct from the player' : pb.analysisInput === 'mic' ? 'Microphone loop-back' : 'None yet';
   const engine = pb.status === 'idle' ? 'Idle' : pb.status === 'loading' ? 'Loading…' : pb.status === 'ready' ? 'Ready' : 'Error';
-  const rows: { k: string; v: string; col: string }[] = [
+  const cells: { k: string; v: string; col: string }[] = [
     { k: 'Analysis input', v: analysis, col: COLOR.text },
-    { k: 'Microphone', v: micOn ? 'Open' : 'Closed', col: micOn ? COLOR.good : COLOR.textDim },
     { k: 'Engine', v: pb.message ? `${engine} — ${pb.message}` : engine, col: pb.status === 'error' ? COLOR.bad : pb.status === 'loading' ? COLOR.warn : COLOR.text },
+    { k: 'Microphone', v: micOn ? 'Open' : 'Closed', col: micOn ? COLOR.good : COLOR.textDim },
     { k: 'Signal', v: features.active ? (silent ? 'Silent' : `Active · ${Math.round(features.level * 100)}%`) : 'Idle', col: features.active && !silent ? COLOR.good : COLOR.textDim },
   ];
-  rows.forEach((r, i) => {
-    const ry = sy + 50 + i * 60;
-    drawText(ctx, r.k, LEFT + 48, ry, 40, COLOR.textFaint, { weight: 600, baseline: 'middle' });
-    ctx.font = font(42, 700);
-    drawText(ctx, fitText(ctx, r.v, RIGHT - LEFT - 96 - 420), LEFT + 48 + 420, ry, 42, r.col, { weight: 700, baseline: 'middle' });
+  const cellW = (RIGHT - LEFT) / 2;
+  cells.forEach((c, i) => {
+    const cx0 = LEFT + 44 + (i % 2) * cellW;
+    const cy1 = sy + 22 + Math.floor(i / 2) * 112;
+    drawText(ctx, c.k, cx0, cy1 + 40, FS.label, COLOR.textFaint, { weight: 700 });
+    ctx.font = font(FS.body, 700);
+    drawText(ctx, fitText(ctx, c.v, cellW - 88), cx0, cy1 + 92, FS.body, c.col, { weight: 700 });
   });
   const needHint = (micOn || pb.analysisInput === 'mic') && silent;
-  const hy = sy + sh - 120;
+  const hy = sy + 22 + 2 * 112 + 8;
+  const hh = sh - (hy - sy) - 22;
+  ctx.font = font(FS.body, 600);
   if (needHint) {
-    fillRound(ctx, LEFT + 32, hy, RIGHT - LEFT - 64, 100, 24, 'rgba(255,196,87,0.13)');
-    strokeRound(ctx, LEFT + 33.5, hy + 1.5, RIGHT - LEFT - 67, 97, 23, 'rgba(255,196,87,0.6)', 3);
-    ctx.font = font(36, 600);
-    wrapText(ctx, 'The microphone hears nothing. Raise the headset volume, keep the audio playing and allow microphone access.', RIGHT - LEFT - 150, 2)
-      .forEach((ln, i) => drawText(ctx, ln, LEFT + 62, hy + 33 + i * 40, 36, COLOR.warn, { weight: 600, baseline: 'middle' }));
+    fillRound(ctx, LEFT + 32, hy, RIGHT - LEFT - 64, hh, 24, 'rgba(255,196,87,0.13)');
+    strokeRound(ctx, LEFT + 33.5, hy + 1.5, RIGHT - LEFT - 67, hh - 3, 23, 'rgba(255,196,87,0.6)', 3);
+    wrapText(ctx, 'The microphone hears nothing. Raise the headset volume, keep the audio playing and allow microphone access.', RIGHT - LEFT - 130, 2)
+      .forEach((ln, i) => drawText(ctx, ln, LEFT + 62, hy + 50 + i * 56, FS.body, COLOR.warn, { weight: 600 }));
   } else {
-    ctx.font = font(36, 500);
-    drawText(ctx, fitText(ctx, 'Tip: the microphone feeds the visuals only. It is never played back.', RIGHT - LEFT - 100), LEFT + 50, hy + 50, 36, COLOR.textFaint, { weight: 500, baseline: 'middle' });
+    wrapText(ctx, 'Tip: the microphone feeds the visuals only. It is never played back.', RIGHT - LEFT - 100, 2)
+      .forEach((ln, i) => drawText(ctx, ln, LEFT + 50, hy + 50 + i * 56, FS.body, COLOR.textFaint, { weight: 600 }));
   }
 }
 
@@ -578,48 +645,53 @@ export function drawSettings(env: TabEnv): void {
   const info = env.renderInfo();
 
   // Recenter
-  const bh = 128;
+  const bh = 132;
+  const gap = 18;
   drawCard(ctx, LEFT, TOP, LW, bh, 30);
-  circle(ctx, LEFT + 80, TOP + bh / 2, 42, 'rgba(255,255,255,0.09)');
-  drawIcon(ctx, 'recenter', LEFT + 80, TOP + bh / 2, 50, a.mainCss);
-  drawText(ctx, 'Recenter menu', LEFT + 160, TOP + 58, 50, COLOR.text, { weight: 800 });
-  drawText(ctx, 'Place it in front of you', LEFT + 160, TOP + 104, 36, COLOR.textDim, { weight: 500 });
+  circle(ctx, LEFT + 84, TOP + bh / 2, 44, 'rgba(255,255,255,0.09)');
+  drawIcon(ctx, 'recenter', LEFT + 84, TOP + bh / 2, 52, a.mainCss);
+  drawText(ctx, 'Recenter menu', LEFT + 168, TOP + 62, 52, COLOR.text, { weight: 800 });
+  drawText(ctx, 'Place it in front of you', LEFT + 168, TOP + 108, FS.label, COLOR.textDim, { weight: 600 });
   hit(env, 'recenter', LEFT, TOP, LW, bh, 30, () => act.recenter());
 
   // Exit / enter VR
-  const ey = TOP + bh + 22;
+  const ey = TOP + bh + gap;
   const inXr = s.mode === 'xr';
   const canEnter = inXr || s.xrSupported;
   ctx.save();
-  if (!canEnter) ctx.globalAlpha = 0.45;
+  if (!canEnter) ctx.globalAlpha = 0.5;
   drawCard(ctx, LEFT, ey, LW, bh, 30, inXr ? 'rgba(255,107,129,0.11)' : undefined);
-  circle(ctx, LEFT + 80, ey + bh / 2, 42, 'rgba(255,255,255,0.09)');
-  drawIcon(ctx, inXr ? 'exit' : 'headset', LEFT + 80, ey + bh / 2, 50, inXr ? COLOR.bad : a.mainCss);
-  drawText(ctx, inXr ? 'Exit VR' : 'Enter VR', LEFT + 160, ey + 58, 50, COLOR.text, { weight: 800 });
-  drawText(ctx, inXr ? 'Return to the 2D page' : canEnter ? 'Start an immersive session' : 'WebXR is not available here', LEFT + 160, ey + 104, 36, COLOR.textDim, { weight: 500 });
+  circle(ctx, LEFT + 84, ey + bh / 2, 44, 'rgba(255,255,255,0.09)');
+  drawIcon(ctx, inXr ? 'exit' : 'headset', LEFT + 84, ey + bh / 2, 52, inXr ? COLOR.bad : a.mainCss);
+  drawText(ctx, inXr ? 'Exit VR' : 'Enter VR', LEFT + 168, ey + 62, 52, COLOR.text, { weight: 800 });
+  ctx.font = font(FS.label, 600);
+  drawText(ctx, fitText(ctx, inXr ? 'Return to the 2D page' : canEnter ? 'Start an immersive session' : 'WebXR is not available here', LW - 168 - 28), LEFT + 168, ey + 108, FS.label, COLOR.textDim, { weight: 600 });
   ctx.restore();
   if (canEnter) hit(env, 'vr', LEFT, ey, LW, bh, 30, () => act.enterVR());
 
   // Auto-hide
-  const ay = ey + bh + 22;
-  const ah = 112;
+  const ay = ey + bh + gap;
+  const ah = 132;
   drawCard(ctx, LEFT, ay, LW, ah, 30);
-  drawText(ctx, 'Auto-hide menu', LEFT + 40, ay + 48, 44, COLOR.text, { weight: 700 });
-  drawText(ctx, 'After 12 s of no input while playing', LEFT + 40, ay + 90, 36, COLOR.textDim, { weight: 500 });
+  drawText(ctx, 'Auto-hide menu', LEFT + 40, ay + 62, FS.body, COLOR.text, { weight: 700 });
+  ctx.font = font(FS.label, 600);
+  drawText(ctx, fitText(ctx, 'After 12 s without input', LW - 40 - 190), LEFT + 40, ay + 108, FS.label, COLOR.textDim, { weight: 600 });
   drawSwitch(ctx, LEFT + LW - 112 - 36, ay + ah / 2, env.autoHide, a);
   hit(env, 'autohide', LEFT, ay, LW, ah, 30, () => env.setAutoHide(!env.autoHide));
 
   // Performance
-  const py = ay + ah + 22;
-  const ph = TOP + 1058 - py;
+  const py = ay + ah + gap;
+  const ph = BOTTOM - py;
   drawCard(ctx, LEFT, py, LW, ph, 30);
-  sectionLabel(env, 'PERFORMANCE', LEFT + 40, py + 64);
+  sectionLabel(env, 'PERFORMANCE', LEFT + 40, py + 68);
   const target = env.presenting ? (info.frameRate || 72) : 60;
   const ratio = s.fps / target;
   const fpsCol = s.fps <= 0 ? COLOR.textDim : ratio >= 0.92 ? COLOR.good : ratio >= 0.7 ? COLOR.warn : COLOR.bad;
-  drawText(ctx, s.fps > 0 ? String(s.fps) : '–', LEFT + 40, py + 220, 150, fpsCol, { weight: 800 });
-  const fw = s.fps > 0 ? ctx.measureText(String(s.fps)).width : 70;
-  drawText(ctx, 'FPS', LEFT + 40 + fw + 22, py + 216, 48, COLOR.textDim, { weight: 700 });
+  ctx.font = font(150, 800);
+  const fpsText = s.fps > 0 ? String(s.fps) : '–';
+  const fw = ctx.measureText(fpsText).width;
+  drawText(ctx, fpsText, LEFT + 40, py + 226, 150, fpsCol, { weight: 800 });
+  drawText(ctx, 'FPS', LEFT + 40 + fw + 24, py + 222, FS.body, COLOR.textDim, { weight: 700 });
   if (!qualityLabel) qualityLabel = detectQuality().toUpperCase();
   const perf: { k: string; v: string }[] = [
     { k: 'Quality', v: qualityLabel },
@@ -628,29 +700,30 @@ export function drawSettings(env: TabEnv): void {
     { k: 'Triangles', v: info.triangles >= 1000 ? `${(info.triangles / 1000).toFixed(info.triangles >= 100000 ? 0 : 1)}k` : String(info.triangles) },
   ];
   perf.forEach((r, i) => {
-    const ry = py + 300 + i * 62;
-    drawText(ctx, r.k, LEFT + 40, ry, 40, COLOR.textFaint, { weight: 600, baseline: 'middle' });
-    drawText(ctx, r.v, LEFT + LW - 40, ry, 40, COLOR.text, { weight: 700, align: 'right', baseline: 'middle' });
+    const ry = py + 316 + i * 68;
+    drawText(ctx, r.k, LEFT + 40, ry, FS.label, COLOR.textFaint, { weight: 700, baseline: 'middle' });
+    drawText(ctx, r.v, LEFT + LW - 40, ry, FS.body, COLOR.text, { weight: 700, align: 'right', baseline: 'middle' });
   });
 
   // Controls legend
   const lx = LEFT + LW + 40;
   const lw = RIGHT - lx;
-  const lh = 1058;
+  const lh = BOTTOM - TOP;
   drawCard(ctx, lx, TOP, lw, lh, 30);
   sectionLabel(env, 'CONTROLS', lx + 44, TOP + 76);
-  const rowH = 148;
+  const rowH = 134;
+  const textX = lx + 44 + 490;
   LEGEND.forEach((row, i) => {
-    const cy = TOP + 190 + i * rowH;
+    const cy = TOP + 182 + i * rowH;
     if (i > 0) {
       ctx.fillStyle = 'rgba(255,255,255,0.07)';
-      ctx.fillRect(lx + 44, cy - rowH / 2 + 2, lw - 88, 2);
+      ctx.fillRect(lx + 44, cy - rowH / 2, lw - 88, 2);
     }
     let x = lx + 44;
     row.caps.forEach((c, ci) => {
       if (ci > 0) {
-        drawText(ctx, '/', x + 12, cy + 1, 36, COLOR.textFaint, { weight: 600, align: 'center', baseline: 'middle' });
-        x += 34;
+        drawText(ctx, '/', x + 14, cy + 2, FS.label, COLOR.textFaint, { weight: 600, align: 'center', baseline: 'middle' });
+        x += 28;
       }
       x += drawKeycap(ctx, x, cy, c, a);
     });
@@ -658,14 +731,13 @@ export function drawSettings(env: TabEnv): void {
       const [i1, i2]: [IconName, IconName] = row.arrows === 'lr' ? ['chevronLeft', 'chevronRight'] : ['chevronDown', 'chevronUp'];
       drawIcon(ctx, i1, x + 34, cy, 54, a.mainCss);
       drawIcon(ctx, i2, x + 34 + 52, cy, 54, a.mainCss);
-      x += 120;
     }
-    ctx.font = font(40, 500);
-    const textX = lx + 44 + 440;
-    const avail = lx + lw - 44 - textX;
+    ctx.font = font(FS.body, 600);
+    const avail = lx + lw - 40 - textX;
     const lines = wrapText(ctx, row.text, avail, 2);
-    lines.forEach((ln, li) => drawText(ctx, ln, textX, cy + (lines.length === 1 ? 2 : li * 46 - 20), 40, COLOR.text, { weight: 500, baseline: 'middle' }));
+    lines.forEach((ln, li) => drawText(ctx, ln, textX, cy + (lines.length === 1 ? 2 : li * 54 - 25), FS.body, COLOR.text, { weight: 600, baseline: 'middle' }));
   });
-  ctx.font = font(36, 500);
-  drawText(ctx, fitText(ctx, 'Hand tracking: point at the menu and pinch to click.', lw - 88), lx + 44, TOP + lh - 34, 36, COLOR.textFaint, { weight: 500 });
+  ctx.font = font(FS.body, 600);
+  wrapText(ctx, 'Hand tracking: point at the menu and pinch to click.', lw - 88, 2)
+    .forEach((ln, i) => drawText(ctx, ln, lx + 44, TOP + lh - 84 + i * 56, FS.body, COLOR.textDim, { weight: 600 }));
 }
