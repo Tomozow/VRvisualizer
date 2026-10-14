@@ -71,35 +71,41 @@ float terrainH(vec2 xz) {
   float age = AGE_MAX * pow(f, 0.85);
   float ax = sqrt(xz.x * xz.x + 4.0) - 2.0; // rounded |x|: no sharp crest along the centre line
   float u = pow(clamp(ax / (HALF_W - 2.0), 0.0, 1.0), 0.6) * 0.94 + 0.01; // mirrored: bass in the centre, treble at the edges
-  float du = 0.035;
-  float da = 2.0 + 0.04 * age;
-  float e = 0.4 * spectrum(u, age)
-          + 0.15 * (spectrum(u - du, age) + spectrum(u + du, age) + spectrum(u, age - da) + spectrum(u, age + da));
+  float du = 0.05;
+  float da = 3.0 + 0.05 * age;
+  float e = 0.3 * spectrum(u, age)
+          + 0.175 * (spectrum(u - du, age) + spectrum(u + du, age) + spectrum(u, age - da) + spectrum(u, age + da));
   e = clamp(e * (0.85 + 0.6 * u), 0.0, 1.3);
 
   float r = length(xz);
-  float taper = smoothstep(2.5, 6.0, r); // flat 2.5 m around the feet, full height by 6 m
+  float taper = smoothstep(2.5, 10.0, r); // flat 2.5 m around the feet, full height by 10 m
   float front = mix(0.65, 1.0, 1.0 - smoothstep(-8.0, 3.0, xz.y)); // strongest ahead (-Z)
   float mask = edgeMask(xz);
 
   // slow undulation so there is landscape even in quiet passages
   float roll = sin(xz.x * 0.16 + uTime * 0.10) * sin(xz.y * 0.12 - uTime * 0.08) * 0.65
              + sin(xz.x * 0.07 + xz.y * 0.10 + uTime * 0.06) * 0.35;
-  float h = pow(e, 1.6) * 5.0 * uIntensity * front + 0.9 + 0.9 * roll;
+  float far = mix(1.0, 2.6, smoothstep(12.0, 35.0, r)); // gentle swells nearby, mountains far away
+  float h = pow(e, 1.6) * 5.0 * uIntensity * front + (0.9 + 0.9 * roll) * far;
 
   // swell travelling across the ground on every beat
   float sw = (r - uBeatRing) / 1.8;
   float swell = exp(-sw * sw) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0));
   h += swell * uBeatAmp * 0.8;
+  // soft height cap: never above 2.2 m within 12 m of the user (look slightly down onto the hills), up to 4 m far away
+  float cap = mix(2.2, 4.0, smoothstep(12.0, 30.0, r));
+  h = cap * (1.0 - exp(-h / cap));
   return h * taper * mask;
 }
 
 void main() {
   vec2 xz = position.xz;
-  const float EPS = 0.3;
-  float h0 = terrainH(xz);
-  float hx = terrainH(xz + vec2(EPS, 0.0));
-  float hz = terrainH(xz + vec2(0.0, EPS));
+  // normals from finite differences over 2 segments (0.6 m) keep the hills round instead of faceted
+  const float EPS = 0.6;
+  float hc = mix(1.0, 0.6, aCeil); // the ceiling is a faint 60 %-height echo
+  float h0 = terrainH(xz) * hc;
+  float hx = terrainH(xz + vec2(EPS, 0.0)) * hc;
+  float hz = terrainH(xz + vec2(0.0, EPS)) * hc;
   vec3 n = normalize(vec3(-(hx - h0) / EPS, 1.0, -(hz - h0) / EPS));
 
   float sgn = 1.0 - 2.0 * aCeil;
@@ -141,9 +147,9 @@ void main() {
   float flip = 1.0 - 2.0 * vCeil;
 
   // Solid pass: gradient by height (dark base -> bright peaks) lit by a fixed key light + hemisphere fill.
-  float g = clamp(0.05 + vH * 0.2, 0.0, 1.0);
+  float g = clamp(0.05 + vH * 0.2, 0.0, 0.85);
   vec3 grad = texture2D(uGradient, vec2(g, 0.5)).rgb;
-  vec3 gradHi = texture2D(uGradient, vec2(clamp(0.35 + vH * 0.2, 0.0, 1.0), 0.5)).rgb;
+  vec3 gradHi = texture2D(uGradient, vec2(clamp(0.35 + vH * 0.2, 0.0, 0.85), 0.5)).rgb;
   vec3 L = normalize(vec3(-0.4, 0.6 * flip, -0.7));
   float lam = clamp(dot(N, L), 0.0, 1.0);
   float ndv = clamp(dot(N, V), 0.0, 1.0);
@@ -160,13 +166,16 @@ void main() {
   float gain = (0.5 + 1.6 * smoothstep(0.0, 3.0, vH)) * (1.0 + 0.9 * exp(-dist / 14.0));
   col += gradHi * lines * gain;
 
+  col *= uBrightness * (0.85 + 0.3 * uLevel) * (1.0 + uBeat * 0.2);
+  // lit faces and crests stay saturated: cap the brightest channel at 0.9 (before tonemapping)
+  col *= min(1.0, 0.9 / max(max(col.r, max(col.g, col.b)), 1e-4));
+  col *= mix(1.0, 0.2, vCeil); // the ceiling is a faint echo
+
   // Beat ring racing across the ground from the user's position.
   float r = length(vWorld.xz);
   float rd = (r - uBeatRing) / 0.3;
   float ringI = exp(-rd * rd) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0)) * smoothstep(2.0, 7.0, uBeatRing);
-  col += mix(uAccent, gradHi, 0.5) * ringI * (0.8 + 1.5 * lines);
-
-  col *= mix(1.0, 0.3, vCeil) * uBrightness * (0.85 + 0.3 * uLevel) * (1.0 + uBeat * 0.2);
+  col += mix(uAccent, gradHi, 0.75) * ringI * (0.6 + 1.2 * lines);
 
   // fog into the background from 25 m, complete by 55 m: the far hills stay faintly visible under the sun
   float fog = smoothstep(25.0, 55.0, dist);

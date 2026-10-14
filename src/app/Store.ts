@@ -52,7 +52,7 @@ export class Store {
     let changed = false;
     for (const k of Object.keys(patch) as (keyof AppState)[]) {
       if (this.state[k] !== patch[k]) {
-        (this.state as any)[k] = patch[k];
+        (this.state as Record<keyof AppState, unknown>)[k] = patch[k];
         this.pending.add(k);
         changed = true;
       }
@@ -109,6 +109,6 @@ export interface Actions {
   setMenuVisible(v: boolean): void;
   /** Move the VR panel back in front of the user */
   recenter(): void;
-  enterVR(): void;
+  enterVR(): Promise<void>;
   toast(text: string, ms?: number): void;
 }

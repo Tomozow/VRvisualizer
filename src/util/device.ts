@@ -14,6 +14,8 @@ export function detectQuality(): QualityLevel {
   if (q === 'low' || q === 'medium' || q === 'high') return q;
   if (isQuest()) return 'medium';
   if (isMobile()) return 'low';
+  // A standalone headset whose UA lacks the Quest token: WebXR present + Android UA → treat as Quest-class.
+  if (/Android/i.test(navigator.userAgent) && 'xr' in navigator) return 'medium';
   return 'high';
 }
 

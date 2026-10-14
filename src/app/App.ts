@@ -110,7 +110,7 @@ export class App implements Actions {
       params,
       autoCycle: this.settings.autoCycle ?? false,
       cycleSeconds: this.settings.cycleSeconds ?? 45,
-      menuVisible: true,
+      menuVisible: false,
       tab: 'player',
       mode: '2d',
       xrSupported: false,
@@ -145,6 +145,7 @@ export class App implements Actions {
     });
 
     this.detectXR();
+    this.renderer.xr.addEventListener('sessionend', () => this.onSessionEnd());
     window.addEventListener('resize', () => this.onResize());
     window.addEventListener('keydown', (e) => this.onKey(e));
     this.store.subscribe((s, changed) => {
@@ -227,8 +228,9 @@ export class App implements Actions {
   }
 
   private onKey(e: KeyboardEvent): void {
+    if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
     const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable)) return;
     switch (e.key) {
       case ' ': e.preventDefault(); this.toggle(); break;
       case 'ArrowRight': e.shiftKey ? this.next() : this.seekBy(10); break;
@@ -267,28 +269,38 @@ export class App implements Actions {
       return;
     }
     if (this.xrSession) {
-      await this.xrSession.end();
+      try { await this.xrSession.end(); } catch { /* already ended */ }
       return;
     }
-    await this.engine.resume();
+    // Audio is optional for entering VR: a blocked context must not abort the session request.
+    try { await this.engine.resume(); } catch { /* resumed later on the first controller gesture */ }
+    let session: XRSession | null = null;
     try {
-      const session = await xr.requestSession('immersive-vr', {
+      session = await xr.requestSession('immersive-vr', {
         optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking', 'layers'],
       });
       this.xrSession = session;
-      session.addEventListener('end', () => {
-        this.xrSession = null;
-        this.store.set({ mode: '2d' });
-        this.onResize();
-      });
       await this.renderer.xr.setSession(session);
       this.store.set({ mode: 'xr', menuVisible: true });
-      // Give the headset a frame to settle its pose before placing the panel
-      setTimeout(() => this.vrui.recenter(), 300);
     } catch (err) {
+      // Never leave the headset inside an immersive session that nothing renders into.
+      this.xrSession = null;
+      try { await session?.end(); } catch { /* ignore */ }
       console.error(err);
       this.toast('Could not start VR session: ' + (err as Error).message, 5000);
     }
+  }
+
+  /** Runs after three.js has torn the session down (its own 'end' listener is registered first). */
+  private onSessionEnd(): void {
+    this.xrSession = null;
+    this.store.set({ mode: '2d', menuVisible: false });
+    // XR overwrote the camera pose; put the desktop view back where it started.
+    this.camera.position.set(0, 1.6, 0);
+    this.camera.quaternion.identity();
+    this.controls?.target.set(0, 1.6, -0.01);
+    this.controls?.update();
+    this.onResize();
   }
 
   // ------------------------------------------------------------------ actions

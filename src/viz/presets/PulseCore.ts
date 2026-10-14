@@ -68,14 +68,13 @@ float snoise(vec3 v) {
 `;
 
 // ---------------------------------------------------------------------------------------------
-// Core: noise-displaced sphere. Large slow lobes (bass), body wobble (mid), fine fast ripples (treble),
-// a spike on the beat. Normals come from displacing two neighbouring points, so shading stays smooth.
+// Core: a smooth breathing sphere. One low-frequency noise (2-3 lobes, bass) plus a very fine ripple (treble).
+// Normals come from displacing two neighbouring points, so shading stays smooth.
 // ---------------------------------------------------------------------------------------------
 const CORE_VERTEX = /* glsl */ `
 ${SIMPLEX_GLSL}
 uniform float uTime;
 uniform float uBass;
-uniform float uMid;
 uniform float uTreble;
 uniform float uBeat;
 uniform float uLevel;
@@ -87,13 +86,10 @@ varying float vDisp;
 
 float displace(vec3 n) {
   float t = uTime;
-  float lobes = snoise(n * 1.25 + vec3(0.0, t * 0.16, t * 0.10));
-  float body = snoise(n * 2.6 + vec3(t * 0.28, -t * 0.20, 3.7));
-  float ripple = snoise(n * 7.0 + vec3(0.0, t * 1.5, t * 1.1));
-  float spike = pow(max(snoise(n * 3.2 + vec3(t * 0.5)), 0.0), 2.0);
-  float d = lobes * (0.07 + 0.26 * uBass) + body * (0.015 + 0.04 * uMid)
-          + ripple * (0.003 + 0.02 * uTreble) + spike * uBeat * 0.11;
-  return clamp(d, -0.45, 0.55); // keeps the surface > 1 m from the listener
+  float lobes = snoise(n * 1.1 + vec3(0.0, t * 0.16, t * 0.10));
+  float ripple = snoise(n * 9.0 + vec3(0.0, t * 1.5, t * 1.1));
+  float d = lobes * (0.04 + 0.15 * uBass + 0.05 * uBeat) + ripple * (0.002 + 0.02 * min(uTreble, 1.0));
+  return clamp(d, -0.2, 0.2); // <= 0.18 x radius of lobes; keeps the surface > 1 m from the listener
 }
 
 void main() {
@@ -145,25 +141,26 @@ void main() {
   float ndv = clamp(dot(normalize(mix(Nb, N, 0.75)), V), 0.0, 1.0);
   vec3 L = normalize(vec3(0.4, 0.7, 0.6));
 
-  // A dark sphere of energy: the body stays dark (gradient 0.1..0.75 only, luminance capped);
-  // only the veins and the Fresnel rim are bright.
-  float dn = clamp(vDisp * 1.6 + 0.5, 0.0, 1.0);
-  vec3 grad = texture2D(uGradient, vec2(0.1 + 0.65 * dn, 0.5)).rgb;
+  // Dark glass sphere of energy: the body uses only the dark half of the gradient (0.05..0.5) with its
+  // luminance capped at 0.16; only a few thin veins, the inner glow and the rim are bright.
+  float dn = clamp(vDisp * 2.2 + 0.5, 0.0, 1.0);
+  vec3 grad = texture2D(uGradient, vec2(0.05 + 0.45 * dn, 0.5)).rgb;
   vec3 body = uBackground * 1.6 * (0.5 + 0.5 * max(dot(N, L), 0.0));
-  body += grad * (0.3 + 0.45 * uBass) * (0.1 + 0.9 * pow(dn, 1.8));
+  body += grad * (0.25 + 0.4 * uBass) * (0.15 + 0.85 * dn);
   float lum = dot(body, vec3(0.2126, 0.7152, 0.0722));
-  vec3 col = body * min(1.0, 0.28 / max(lum, 1e-4));
+  vec3 col = body * min(1.0, 0.16 / max(lum, 1e-4));
 
-  // veins: ridged noise, thin bright lines that crawl over the surface (<= 1.2)
-  float vn = snoise(vDir * 2.7 + vec3(0.0, uTime * 0.12, uTime * 0.07));
-  float vein = pow(1.0 - abs(vn), 9.0);
+  // veins: zero set of a low-frequency noise -> a few thin arcs (~10 % of the surface) with a soft glow falloff (<= 1.3)
+  float vn = abs(snoise(vDir * 2.0 + vec3(0.0, uTime * 0.12, uTime * 0.07)));
+  float vein = min((1.0 - smoothstep(0.0, 0.045, vn)) + exp(-vn * 14.0) * 0.3, 1.0);
   vec3 veinCol = texture2D(uGradient, vec2(0.45 + 0.3 * dn, 0.5)).rgb;
-  col += veinCol * vein * min(0.5 + 1.1 * uBass + 0.8 * uBeat, 1.2);
+  col += veinCol * vein * min(0.6 + 0.9 * uBass + 0.6 * uBeat, 1.3);
 
-  // Fresnel rim (<= 1.6) and a small specular highlight
+  // soft core light (inverse Fresnel), thin bright Fresnel rim (<= 1.6), small specular
+  col += uPrimary * pow(ndv, 4.0) * 0.18;
   col += mix(uAccent, uPrimary, 0.45) * pow(1.0 - ndv, 4.5) * 1.6;
   vec3 H = normalize(L + V);
-  col += mix(uAccent, uPrimary, 0.3) * pow(max(dot(N, H), 0.0), 32.0) * 0.4;
+  col += mix(uAccent, uPrimary, 0.3) * pow(max(dot(N, H), 0.0), 32.0) * 0.3;
 
   gl_FragColor = vec4(col * uBrightness, uOpacity);
   #include <tonemapping_fragment>
@@ -481,7 +478,7 @@ export class PulseCore implements Preset {
     });
 
     // --- core ---
-    this.coreU = { ...shared(), uBass: { value: 0 }, uMid: { value: 0 }, uTreble: { value: 0 } };
+    this.coreU = { ...shared(), uBass: { value: 0 }, uTreble: { value: 0 } };
     const coreGeo = createIcoSphere(q.freq);
     const coreMat = new THREE.ShaderMaterial({
       uniforms: this.coreU,
@@ -594,7 +591,6 @@ export class PulseCore implements Preset {
       u.uBrightness.value = bright;
     }
     this.coreU.uBass.value = bass;
-    this.coreU.uMid.value = mid;
     this.coreU.uTreble.value = treble;
     this.coronaU.uSize.value = 6 + 0.8 * level + 0.5 * beat;
     this.ringU.uMid.value = Math.min(1, mid);
