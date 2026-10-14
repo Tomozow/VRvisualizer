@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { AudioFeatures } from '@/audio/types';
 import type { Preset, PresetContext, VizParams } from '@/viz/types';
+import { OUTPUT_GLSL } from '@/viz/shared/Shading';
 
 const CORE_POS = new THREE.Vector3(0, 1.6, -6); // 6 m ahead at eye height: the nearest surface is > 3.4 m from the head
 const CORE_RADIUS = 2.0;
@@ -9,11 +10,16 @@ const SHOCK_LIFE = 1.2; // seconds
 const SHOCK_R0 = 2.2;
 const SHOCK_R_WALL = 16; // upright ring facing the user
 const SHOCK_R_FLOOR = 24; // ring on the floor, so the room behind you pulses too
+const SHOCK_BAND = 1.0; // metres behind the leading edge that a shockwave ring still draws (its wake is gone by then)
 const RING_RADII = [3.3, 3.9, 4.5];
 const BACK_CORONA_POS = new THREE.Vector3(0, 1.6, 8); // dim glow behind the listener so the back is never empty
 const BURST_LIFE = 0.6; // seconds a beat burst of sparks lives
 const CLEAR_NEAR = 1.2; // metres: nothing is drawn closer to the head than this
 const CLEAR_FAR = 2.4; // ... and everything is fully visible beyond this
+// The corona sprites are drawn at this fraction of their nominal width as a 24-gon instead of a quad (~57 % of the
+// pixels of the biggest fill cost in the scene); the falloff is remapped by the same factor, so the glow profile is
+// unchanged except for a smooth window over the outermost (< 2 levels) part of the tail.
+const CORONA_SCALE = 0.85;
 
 const QUALITY = {
   low: { freq: 24, swarm: 1500, sparks: 100 },
@@ -121,11 +127,11 @@ void main() {
   gl_Position = projectionMatrix * viewMatrix * wp;
 }`;
 
+// highp (default): the veins are simplex noise, whose permutation arithmetic breaks down in half precision
 const CORE_FRAGMENT = /* glsl */ `
+${OUTPUT_GLSL}
 ${SIMPLEX_GLSL}
 uniform sampler2D uGradient;
-uniform vec3 uAccent;
-uniform vec3 uPrimary;
 uniform vec3 uSecondary;
 uniform float uTime;
 uniform float uOpacity;
@@ -146,13 +152,14 @@ void main() {
   float ndv = clamp(dot(normalize(mix(Nb, N, 0.75)), V), 0.0, 1.0);
   vec3 L = normalize(vec3(0.4, 0.7, 0.6));
 
-  // Dark glass sphere of energy: the body is the violet-to-pink part of the gradient (0.15..0.55) with its
-  // luminance capped at 0.10 and no neutral tint; the veins, the inner light and the rim carry all the brightness.
+  // Dark glass sphere of energy: the body is the violet-to-pink part of the gradient (0.15..0.55), lit by the key
+  // light only, soft-capped well below 0.10 luma and with no neutral tint; the veins, the inner light and the rim
+  // carry all the brightness.
   float dn = clamp(vDisp * 2.6 + 0.5, 0.0, 1.0);
   vec3 grad = texture2D(uGradient, vec2(0.15 + 0.40 * dn, 0.5)).rgb;
   vec3 body = grad * (0.35 + 0.65 * max(dot(N, L), 0.0)) * (0.3 + 0.7 * dn) * (0.8 + 0.8 * uBass);
   float lum = dot(body, vec3(0.2126, 0.7152, 0.0722));
-  vec3 col = body * min(1.0, 0.10 / max(lum, 1e-4));
+  vec3 col = body / (1.0 + lum * 20.0); // luma < 0.05 (~0.25 after the output curve); a hard clamp would flatten the shading
 
   // veins: zero set of a low-frequency noise -> a few thin arcs (~10 % of the surface) with a soft glow falloff
   float vn = abs(snoise(vDir * 2.0 + vec3(0.0, uTime * 0.12, uTime * 0.07)));
@@ -161,20 +168,19 @@ void main() {
   col += veinCol * vein * (1.2 + 0.6 * min(uBass + 0.5 * uBeat, 1.0)); // up to 1.8
 
   // inner emissive light shining through the glass, strongest face-on, breathing with the bass
-  col += texture2D(uGradient, vec2(0.6 + 0.3 * dn, 0.5)).rgb * (0.25 + 0.8 * uBass) * pow(ndv, 4.0) * 0.16;
+  float ndv2 = ndv * ndv;
+  col += texture2D(uGradient, vec2(0.6 + 0.3 * dn, 0.5)).rgb * (0.25 + 0.8 * uBass) * (ndv2 * ndv2) * 0.22;
 
-  // Fresnel rim tinted with the palette's secondary colour, small specular
-  col += uSecondary * pow(1.0 - ndv, 3.0) * 1.2;
-  vec3 H = normalize(L + V);
-  col += mix(uAccent, uPrimary, 0.3) * pow(max(dot(N, H), 0.0), 32.0) * 0.3;
+  // Fresnel rim tinted with the palette's secondary colour. No specular: on the lumpy surface it smears into
+  // broad dusty patches that read as stone.
+  float rim = max(1.0 - ndv, 0.0);
+  col += uSecondary * (rim * rim * rim) * 1.2;
 
-  gl_FragColor = vec4(col * uBrightness, uOpacity);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  gl_FragColor = vec4(cheapOutput(col * uBrightness), uOpacity);
 }`;
 
 // ---------------------------------------------------------------------------------------------
-// Corona: camera-facing quads, two instances (behind the core, and a dim one behind the listener).
+// Corona: camera-facing discs, two instances (behind the core, and a dim one behind the listener).
 // (A single huge gl_PointSize would be clamped by many GPUs.) aCor = (width in m, gain, bass pulse amount).
 // ---------------------------------------------------------------------------------------------
 const CORONA_VERTEX = /* glsl */ `
@@ -190,11 +196,13 @@ void main() {
   // keeps it off the core's surface while its projected centre and angular size stay unchanged
   float k = (length(mv.xyz) + 2.6) / length(mv.xyz);
   mv.xyz *= k;
-  mv.xy += position.xy * (aCor.x + uSizeBoost) * k;
+  mv.xy += position.xy * (aCor.x + uSizeBoost) * ${CORONA_SCALE.toFixed(4)} * k;
   gl_Position = projectionMatrix * mv;
 }`;
 
 const CORONA_FRAGMENT = /* glsl */ `
+precision mediump float;
+${OUTPUT_GLSL}
 uniform vec3 uPrimary;
 uniform vec3 uAccent;
 uniform float uOpacity;
@@ -205,15 +213,14 @@ uniform float uBass;
 varying vec2 vUv;
 varying vec3 vCor;
 void main() {
-  float d = length(vUv);
-  float fall = 1.0 - smoothstep(0.0, 1.0, d);
-  float glow = pow(fall, 2.4);
+  float dn = length(vUv); // 0 at the centre, 1 at the disc edge
+  float fall = 1.0 - smoothstep(0.0, 1.0, dn * ${CORONA_SCALE.toFixed(4)});
+  float f2 = fall * fall;
+  float glow = pow(fall, 2.4) * (1.0 - smoothstep(0.65, 1.0, dn)); // the window ends the (sub-level) tail smoothly at the edge
   float pulse = mix(1.0, 0.45 + 1.1 * uBass, vCor.z); // the back corona swells with the bass
   vec3 col = uPrimary * glow * (0.3 + 0.4 * uLevel) * vCor.y * pulse;
-  col += mix(uAccent, uPrimary, 0.3) * pow(fall, 4.0) * uBeat * 0.35 * vCor.y; // inner flash on the beat
-  gl_FragColor = vec4(col * uBrightness * uOpacity, 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  col += mix(uAccent, uPrimary, 0.3) * (f2 * f2) * uBeat * 0.35 * vCor.y; // inner flash on the beat
+  gl_FragColor = vec4(cheapOutputAdditive(col * uBrightness * uOpacity), 1.0);
 }`;
 
 // ---------------------------------------------------------------------------------------------
@@ -232,7 +239,9 @@ void main() {
   gl_Position = projectionMatrix * viewMatrix * wp;
 }`;
 
+// highp (default): the dash phase is fract() of a time-driven value
 const RING_FRAGMENT = /* glsl */ `
+${OUTPUT_GLSL}
 uniform sampler2D uGradient;
 uniform float uTime;
 uniform float uMid;
@@ -247,59 +256,61 @@ void main() {
   float dir = mod(k, 2.0) < 0.5 ? 1.0 : -1.0;
   // comet-like dashes running around the ring: bright head, long tail
   float seg = fract(vUv.x * (3.0 + k) - uTime * dir * (0.07 + 0.04 * k));
-  float comet = pow(seg, 10.0) + 0.3 * pow(seg, 1.6);
+  float s2 = seg * seg, s4 = s2 * s2;
+  float comet = s4 * s4 * s2 + 0.3 * pow(seg, 1.6); // seg^10 + 0.3 seg^1.6 (seg = fract >= 0)
   vec3 col = texture2D(uGradient, vec2(0.4 + 0.15 * k + 0.35 * comet, 0.5)).rgb;
   col *= (0.08 + comet) * (0.5 + 1.8 * uMid + 0.8 * uBeat);
   // never draw close to the listener's head
   col *= smoothstep(${CLEAR_NEAR.toFixed(1)}, ${CLEAR_FAR.toFixed(1)}, distance(vWorld, cameraPosition));
-  gl_FragColor = vec4(col * uBrightness * uOpacity, 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  gl_FragColor = vec4(cheapOutputAdditive(col * uBrightness * uOpacity), 1.0);
 }`;
 
 // ---------------------------------------------------------------------------------------------
 // Shockwaves: instances 0..5 are upright rings facing the user, 6..11 lie on the floor.
-// Radius / orientation come from the instance matrix, age + power from `aWave`.
+// Radius / orientation come from the instance matrix, age + power from `aWave`. The unit annulus (0.5..1) is shrunk
+// in the vertex shader to the outer SHOCK_BAND metres (the wake is windowed to zero over that band), so a 16-24 m
+// ring covers a thin band of pixels instead of half its disc.
 // ---------------------------------------------------------------------------------------------
 const SHOCK_VERTEX = /* glsl */ `
 attribute vec2 aWave; // x: age 0..1 (>= 1 = inactive), y: power
-varying float vRho;
-varying float vScale;
+varying float vD;     // metres behind the leading edge
 varying float vAge;
 varying float vPower;
 varying vec3 vWorld;
 void main() {
-  vRho = length(position.xy);
-  vScale = length(instanceMatrix[0].xyz);
+  float scale = length(instanceMatrix[0].xyz);
+  float rin = max(0.5, 1.0 - ${SHOCK_BAND.toFixed(1)} / max(scale, 1e-3));
+  float rho0 = length(position.xy); // 0.5 (inner) .. 1 (outer)
+  float rho = mix(rin, 1.0, (rho0 - 0.5) * 2.0);
+  vD = (1.0 - rho) * scale;
   vAge = aWave.x;
   vPower = aWave.y;
-  vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
+  vec4 wp = modelMatrix * instanceMatrix * vec4(position.xy * (rho / rho0), position.z, 1.0);
   vWorld = wp.xyz;
   gl_Position = projectionMatrix * viewMatrix * wp;
 }`;
 
 const SHOCK_FRAGMENT = /* glsl */ `
+precision mediump float;
+${OUTPUT_GLSL}
 uniform vec3 uAccent;
 uniform float uOpacity;
 uniform float uBrightness;
-varying float vRho;
-varying float vScale;
+varying float vD;
 varying float vAge;
 varying float vPower;
 varying vec3 vWorld;
 void main() {
-  float d = (1.0 - vRho) * vScale;   // metres behind the leading edge
+  float d = vD;
   // thin (~12 cm) bright ring at the leading edge + a faint wake
   float ed = (d - 0.08) / 0.055;
   float ring = exp(-ed * ed);
-  float wake = smoothstep(0.0, 0.06, d) * exp(-d * 4.0) * 0.06;
+  float wake = smoothstep(0.0, 0.06, d) * exp(-d * 4.0) * 0.06 * (1.0 - smoothstep(${(SHOCK_BAND * 0.5).toFixed(2)}, ${SHOCK_BAND.toFixed(2)}, d));
   float life = pow(clamp(1.0 - vAge, 0.0, 1.0), 1.3);
   vec3 col = uAccent * (ring * 1.9 + wake);
   col *= min(1.0, 1.1 / max(max(col.r, max(col.g, col.b)), 1e-4)); // stay saturated instead of washing out to white
   col *= life * vPower * uBrightness * uOpacity * smoothstep(${CLEAR_NEAR.toFixed(1)}, ${CLEAR_FAR.toFixed(1)}, distance(vWorld, cameraPosition));
-  gl_FragColor = vec4(col, 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  gl_FragColor = vec4(cheapOutputAdditive(col), 1.0);
 }`;
 
 // ---------------------------------------------------------------------------------------------
@@ -347,11 +358,12 @@ void main() {
     float sr = sqrt(1.0 - cu * cu);
     vec3 dir = vec3(sr * cos(ph), cu, sr * sin(ph));
     float travel = (3.0 + 6.0 * q.z) * (1.0 - 0.7 * smoothstep(0.0, 0.9, dir.z)); // the burst never rushes the listener
-    float ease = 1.0 - pow(1.0 - life, 2.2);
+    float rest = max(1.0 - life, 0.0);
+    float ease = 1.0 - pow(rest, 2.2);
     p = CORE + dir * (${CORE_RADIUS.toFixed(2)} * 1.02 + travel * ease) - vec3(0.0, 0.8 * life * life, 0.0);
     size = (0.08 + 0.09 * s.w) * (1.0 - 0.5 * life);
     tint = 0.82 + 0.16 * s.w;
-    gain = 3.0 * uBurstPower * pow(1.0 - life, 1.2);
+    gain = 3.0 * uBurstPower * pow(rest, 1.2);
   } else if (r.x < 0.55) {
     // orbiting swarm, radius 3.2 .. 8.9 m around the core
     float R = 3.2 + 5.7 * pow(r.y, 1.4);
@@ -406,15 +418,15 @@ void main() {
 }`;
 
 const SWARM_FRAGMENT = /* glsl */ `
+precision mediump float;
+${OUTPUT_GLSL}
 uniform float uOpacity;
 uniform float uBrightness;
 varying vec3 vColor;
 void main() {
   float d = length(gl_PointCoord - 0.5) * 2.0;
   float a = exp(-d * d * 4.0) * (1.0 - smoothstep(0.8, 1.0, d));
-  gl_FragColor = vec4(vColor * a * 1.5 * uBrightness * uOpacity, 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  gl_FragColor = vec4(cheapOutputAdditive(vColor * a * 1.5 * uBrightness * uOpacity), 1.0);
 }`;
 
 /** Indexed unit icosphere (PolyhedronGeometry is non-indexed: detail 48 would be 144k vertices instead of 23k). */
@@ -485,6 +497,7 @@ export class PulseCore implements Preset {
 
   private renderer!: THREE.WebGLRenderer;
   private core!: THREE.Mesh;
+  private coreMat!: THREE.ShaderMaterial;
   private rings!: THREE.InstancedMesh;
   private shock!: THREE.InstancedMesh;
   private waveAttr!: THREE.InstancedBufferAttribute;
@@ -532,9 +545,10 @@ export class PulseCore implements Preset {
       uniforms: this.coreU,
       vertexShader: CORE_VERTEX,
       fragmentShader: CORE_FRAGMENT,
-      transparent: true,
+      transparent: false,
       depthWrite: true,
     });
+    this.coreMat = coreMat;
     this.core = new THREE.Mesh(coreGeo, coreMat);
     this.core.position.copy(CORE_POS);
     this.core.frustumCulled = false; // displaced in the vertex shader
@@ -542,7 +556,7 @@ export class PulseCore implements Preset {
 
     // --- corona ---
     this.coronaU = { ...shared(), uSizeBoost: { value: 0 }, uBass: { value: 0 } };
-    const coronaGeo = new THREE.PlaneGeometry(1, 1);
+    const coronaGeo = new THREE.CircleGeometry(0.5, 24);
     // instance 0: behind the core (11 m wide); instance 1: dim and bass-pulsed behind the listener (9 m, 0.35x)
     coronaGeo.setAttribute('aCor', new THREE.InstancedBufferAttribute(new Float32Array([11, 0.75, 0, 9, 0.35 * 0.75, 1]), 3));
     const coronaMat = new THREE.ShaderMaterial({
@@ -682,6 +696,9 @@ export class PulseCore implements Preset {
 
   setOpacity(o: number): void {
     for (const u of this.allUniforms) u.uOpacity.value = o;
+    // the core is fully opaque (no blending, depth-tested) except while a crossfade runs
+    this.coreMat.transparent = o < 0.999;
+    this.coreMat.depthWrite = true;
   }
 
   dispose(): void {

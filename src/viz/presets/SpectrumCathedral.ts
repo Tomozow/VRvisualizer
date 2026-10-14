@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { AudioFeatures } from '@/audio/types';
 import type { Preset, PresetContext, VizParams } from '@/viz/types';
 import { HISTORY_GLSL } from '@/viz/shared/AudioTextures';
+import { OUTPUT_GLSL } from '@/viz/shared/Shading';
 
 /** Frames between neighbouring history rings (≈83 ms at 72 Hz): the spectrum "echoes" outwards. */
 const HISTORY_STEP = 6;
@@ -14,6 +15,8 @@ const BREATH_ATTACK = 0.09; // s
 const BREATH_RELEASE = 0.4; // s
 /** Rings below this index are solid glass pillars; the rest are halo-only ghosts. */
 const SOLID_RINGS = 2;
+/** Halo pillars quieter than this (energy of the newest rows) are moved off-screen: their glow is zero anyway. */
+const HALO_MIN_ENERGY = 0.12;
 
 interface CathedralLayout {
   pillars: number;
@@ -28,7 +31,7 @@ const LAYOUT: Record<string, CathedralLayout> = {
 
 /**
  * Vertex stage shared by the solid pillars and the additive halo pass.
- * Every pillar is a unit box scaled/placed here; per-instance data = (angle 0..1, ring, mirror flag, random).
+ * Every pillar is a unit box scaled/placed here; per-instance data = (angle 0..1, ring, mirror flag).
  * The floor reflection is a 180° rotation about the pillar's radial axis (so triangle winding survives).
  *
  * Height = spectrum energy averaged over 3 history rows, soft-limited with tanh (tips stay in view), and
@@ -46,7 +49,7 @@ ${HISTORY_GLSL}
 #define HALO ${halo ? 1 : 0}
 const float TAU = 6.28318530718;
 
-attribute vec4 aData; // x: angle (0 = ahead, -Z), y: ring, z: mirror, w: random
+attribute vec3 aData; // x: angle (0 = ahead, -Z), y: ring, z: mirror
 uniform float uTime;
 uniform float uIntensity;
 uniform float uMid;
@@ -60,7 +63,6 @@ varying float vTip; // metres below the pillar tip
 varying float vEnergy;
 varying float vRing;
 varying float vMirror;
-varying float vRand;
 
 void main() {
   float ring = aData.y;
@@ -77,16 +79,23 @@ void main() {
 
   float hMax = 8.0 + 0.9 * ring;
   float raw[13];
-  for (int j = 0; j < 13; j++) raw[j] = histFreq(u, age0 + float(j));
+  for (int j = 0; j < 3; j++) raw[j] = histFreq(u, age0 + float(j));
+  float e = clamp((raw[0] + raw[1] + raw[2]) * (1.0 / 3.0) * gain, 0.0, 1.25);
+  #if HALO
+    // the halo is invisible below this energy (its fragment ramp starts at 0.2): skip the rest of the work too
+    if (e < ${HALO_MIN_ENERGY.toFixed(2)}) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
+  #endif
+  for (int j = 3; j < 13; j++) raw[j] = histFreq(u, age0 + float(j));
   float h = 1e4;
-  float e = 0.0;
   for (int k = 0; k < 6; k++) {
     int j = 2 * k;
-    float ek = clamp((raw[j] + raw[j + 1] + raw[j + 2]) * (1.0 / 3.0) * gain, 0.0, 1.25);
+    float ek = k == 0 ? e : clamp((raw[j] + raw[j + 1] + raw[j + 2]) * (1.0 / 3.0) * gain, 0.0, 1.25);
     float hk = 0.2 + pow(ek, 1.4) * 6.0 * uIntensity * (1.0 + 0.1 * ring);
     hk = hMax * tanh(hk / hMax);
     h = min(h, hk + RISE_PER_ROW * float(j));
-    if (k == 0) e = ek;
   }
 
   float radius = 4.5 + 9.5 * pow(ring / RING_MAX, 0.85) + uBreath;
@@ -98,7 +107,7 @@ void main() {
   float d = w * 0.8;
   float hh = h;
   #if HALO
-    w *= 3.6; d *= 3.6; hh += 0.4;
+    w *= 2.2; d *= 2.2; hh += 0.4;
   #endif
 
   float sgn = 1.0 - 2.0 * mirror;
@@ -117,12 +126,17 @@ void main() {
   vEnergy = e;
   vRing = ring;
   vMirror = mirror;
-  vRand = aData.w;
   gl_Position = projectionMatrix * viewMatrix * wp;
 }`;
 }
 
-const SOLID_FRAGMENT = /* glsl */ `
+/**
+ * Opaque pillar pass (`reflect = false`) and blended floor-reflection pass (`reflect = true`) share this body.
+ * Stays highp: the LED rows use fract/fwidth of the world height.
+ */
+function solidFragment(reflect: boolean): string {
+  return /* glsl */ `
+${OUTPUT_GLSL}
 uniform sampler2D uGradient;
 uniform float uOpacity;
 uniform float uBrightness;
@@ -137,8 +151,6 @@ varying float vLocalY;
 varying float vTip;
 varying float vEnergy;
 varying float vRing;
-varying float vMirror;
-varying float vRand;
 
 void main() {
   vec3 N = normalize(vNormal);
@@ -154,7 +166,7 @@ void main() {
   hot = mix(hot, vec3(1.0), 0.35 * uBeat); // white only on beat peaks
 
   // Dark glass body that brightens toward the top of each pillar.
-  float up = pow(vLocalY, 1.3);
+  float up = pow(max(vLocalY, 0.0), 1.3); // varyings can extrapolate slightly below 0 under MSAA
   vec3 col = grad * (0.2 + 0.55 * up) * (0.55 + 0.45 * ndv);
 
   // Luminous vertical edges.
@@ -171,8 +183,9 @@ void main() {
   float cap = 1.0 - smoothstep(0.0, 0.35, vTip);
   col += hot * cap * (0.35 + 0.9 * vEnergy);
 
-  // Fresnel rim.
-  col += grad * pow(1.0 - ndv, 3.0) * 0.35;
+  // Fresnel rim (ndv can exceed 1 by an ulp: keep the pow base non-negative).
+  float rim = max(1.0 - ndv, 0.0);
+  col += grad * (rim * rim * rim) * 0.35;
 
   // Beat wave climbing the pillars, delayed on the outer rings.
   float ph = uBeatWave - vRing * 0.07;
@@ -182,18 +195,21 @@ void main() {
   col += mix(texture2D(uGradient, vec2(0.7, 0.5)).rgb, uAccent, 0.25) * wave * 0.55;
 
   // Rings further out are dimmer and dissolve into the dark with distance.
-  float fade = exp(-pow(dist * 0.045, 2.0)) / (1.0 + 0.4 * vRing);
+  float dn = dist * 0.045;
+  float fade = exp(-dn * dn) / (1.0 + 0.4 * vRing);
   col *= fade * 0.7 * uBrightness * (1.0 + uBeat * 0.3);
   // keep the brightest channel under 0.85 so lit tips stay saturated instead of blowing out to white
   col *= min(1.0, 0.85 / max(max(col.r, col.g), max(col.b, 1e-4)));
 
-  float mirrorFade = mix(1.0, 0.3 * exp(-y * 0.6), vMirror);
-  gl_FragColor = vec4(col, uOpacity * mirrorFade);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  ${reflect ? 'float mirrorFade = 0.3 * exp(-y * 0.6);' : 'float mirrorFade = 1.0;'}
+  gl_FragColor = vec4(cheapOutput(col), uOpacity * mirrorFade);
 }`;
+}
 
+/** Additive halo: no grid / fract maths, so mediump is enough. */
 const HALO_FRAGMENT = /* glsl */ `
+precision mediump float;
+${OUTPUT_GLSL}
 uniform sampler2D uGradient;
 uniform float uOpacity;
 uniform float uBrightness;
@@ -203,11 +219,9 @@ varying vec3 vNormal;
 varying vec3 vWorld;
 varying vec2 vUv;
 varying float vLocalY;
-varying float vTip;
 varying float vEnergy;
 varying float vRing;
 varying float vMirror;
-varying float vRand;
 
 void main() {
   vec3 N = normalize(vNormal);
@@ -222,28 +236,28 @@ void main() {
   // Soft vertical band: bright at the centre of each face, zero at the box edges, strongest near the tip.
   float fx = 1.0 - abs(vUv.x * 2.0 - 1.0);
   fx *= fx;
-  float amt = fx * ndv * pow(vLocalY, mix(2.2, 1.3, ghostRing)) * smoothstep(0.2, 0.9, vEnergy);
+  float amt = fx * ndv * pow(max(vLocalY, 0.0), mix(2.2, 1.3, ghostRing)) * smoothstep(0.2, 0.9, vEnergy);
 
   float g = clamp(0.18 + y * 0.05 + vEnergy * 0.30 - vRing * 0.06, 0.0, 0.82);
-  vec3 col = texture2D(uGradient, vec2(g, 0.5)).rgb * amt * alpha * 1.0 * uBrightness * (1.0 + uBeat * 0.35);
+  vec3 col = texture2D(uGradient, vec2(g, 0.5)).rgb * amt * alpha * uBrightness * (1.0 + uBeat * 0.35);
   col *= mix(1.0, 0.3 * exp(-y * 0.5), vMirror) * uOpacity;
-  gl_FragColor = vec4(col, 1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
+  gl_FragColor = vec4(cheapOutputAdditive(col), 1.0);
 }`;
 
-/** Instance spec: which rings to emit and whether each gets its floor reflection too. */
+/** One block of instances: a ring, drawn either upright (mirror 0) or as its floor reflection (mirror 1). */
 interface InstanceSpec {
   ring: number;
-  mirror: boolean;
+  mirror: 0 | 1;
 }
 
 /**
  * A cylindrical cathedral of spectrum pillars: the live spectrum on the two inner rings as solid glass, the
  * deeper history rings as faint halo ghosts so the spectrum ripples outwards into the dark, the front rings
  * reflected in the floor.
- * Draw calls: 1 solid InstancedMesh (rings 0-1 + reflections) + 1 additive halo mesh (ring 0 + ghost rings).
- * Vertices (medium): (4 x 96 solid + 2 x 96 + 5 x 96 halo) x 24 = ~25k.
+ * Draw calls (3): opaque InstancedMesh with the upright pillars of rings 0-1, drawn near -> far for early-Z; a
+ * blended InstancedMesh with their reflections; one additive halo mesh (ring 0 + reflection + ghost rings).
+ * Vertices (medium): (2 x 96 opaque + 2 x 96 reflected + up to 8 x 96 halo) x 24 = ~29k, the halo mostly culled
+ * in the vertex shader while quiet.
  */
 export class SpectrumCathedral implements Preset {
   readonly id = 'spectrum';
@@ -252,6 +266,7 @@ export class SpectrumCathedral implements Preset {
   readonly group = new THREE.Group();
 
   private uniforms!: Record<string, THREE.IUniform>;
+  private solidMat!: THREE.ShaderMaterial;
   private meshes: THREE.InstancedMesh[] = [];
   private disposables: { dispose(): void }[] = [];
   private time = 0;
@@ -279,72 +294,70 @@ export class SpectrumCathedral implements Preset {
     const box = new THREE.BoxGeometry(1, 1, 1);
     box.translate(0, 0.5, 0); // grow from the floor
 
-    // Solid pass: inner rings only, far -> near so alpha-blended crossfades composite back to front.
+    const make = (spec: InstanceSpec[], mat: THREE.ShaderMaterial): THREE.InstancedMesh => {
+      const geo = box.clone();
+      const count = this.addInstances(geo, layout, spec);
+      const mesh = new THREE.InstancedMesh(geo, mat, count);
+      mesh.frustumCulled = false; // placement happens entirely in the vertex shader
+      this.group.add(mesh);
+      this.meshes.push(mesh);
+      this.disposables.push(geo, mat, mesh);
+      return mesh;
+    };
+
+    // Opaque pass: upright pillars of the solid rings, nearest ring first so early-Z rejects what is behind it.
     const solidSpec: InstanceSpec[] = [];
-    for (let ring = SOLID_RINGS - 1; ring >= 0; ring--) solidSpec.push({ ring, mirror: true });
-    const solidGeo = box.clone();
-    const solidCount = this.addInstances(solidGeo, layout, solidSpec);
-    const solid = new THREE.InstancedMesh(
-      solidGeo,
-      new THREE.ShaderMaterial({
-        uniforms: this.uniforms,
-        vertexShader: pillarVertex(layout, false),
-        fragmentShader: SOLID_FRAGMENT,
-        transparent: true,
-        depthWrite: true,
-      }),
-      solidCount,
-    );
+    for (let ring = 0; ring < SOLID_RINGS; ring++) solidSpec.push({ ring, mirror: 0 });
+    this.solidMat = new THREE.ShaderMaterial({
+      uniforms: this.uniforms,
+      vertexShader: pillarVertex(layout, false),
+      fragmentShader: solidFragment(false),
+      transparent: false,
+      depthWrite: true,
+    });
+    make(solidSpec, this.solidMat);
+
+    // Reflection pass: far -> near so the blend composites back to front.
+    const reflectSpec: InstanceSpec[] = [];
+    for (let ring = SOLID_RINGS - 1; ring >= 0; ring--) reflectSpec.push({ ring, mirror: 1 });
+    make(reflectSpec, new THREE.ShaderMaterial({
+      uniforms: this.uniforms,
+      vertexShader: pillarVertex(layout, false),
+      fragmentShader: solidFragment(true),
+      transparent: true,
+      depthWrite: true,
+    }));
 
     // Halo pass: the live ring (wider soft boxes, reflected) plus the ghost rings (no reflection), additive.
-    const haloSpec: InstanceSpec[] = [{ ring: 0, mirror: true }];
-    for (let ring = SOLID_RINGS; ring < layout.rings; ring++) haloSpec.push({ ring, mirror: false });
-    const haloGeo = box.clone();
-    const haloCount = this.addInstances(haloGeo, layout, haloSpec);
-    const halo = new THREE.InstancedMesh(
-      haloGeo,
-      new THREE.ShaderMaterial({
-        uniforms: this.uniforms,
-        vertexShader: pillarVertex(layout, true),
-        fragmentShader: HALO_FRAGMENT,
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      }),
-      haloCount,
-    );
-    box.dispose();
-
-    for (const m of [solid, halo]) {
-      m.frustumCulled = false; // placement happens entirely in the vertex shader
-      this.group.add(m);
-      this.meshes.push(m);
-      this.disposables.push(m.geometry, m.material as THREE.Material, m);
-    }
+    const haloSpec: InstanceSpec[] = [{ ring: 0, mirror: 0 }, { ring: 0, mirror: 1 }];
+    for (let ring = SOLID_RINGS; ring < layout.rings; ring++) haloSpec.push({ ring, mirror: 0 });
+    const halo = make(haloSpec, new THREE.ShaderMaterial({
+      uniforms: this.uniforms,
+      vertexShader: pillarVertex(layout, true),
+      fragmentShader: HALO_FRAGMENT,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    }));
     halo.renderOrder = 1;
+    box.dispose();
   }
 
-  /** Adds the per-instance `aData` attribute for the given rings (in order) and returns the instance count. */
+  /** Adds the per-instance `aData` attribute for the given blocks (in order) and returns the instance count. */
   private addInstances(geo: THREE.BufferGeometry, layout: CathedralLayout, spec: InstanceSpec[]): number {
-    let total = 0;
-    for (const s of spec) total += layout.pillars * (s.mirror ? 2 : 1);
-    const data = new Float32Array(total * 4);
+    const total = layout.pillars * spec.length;
+    const data = new Float32Array(total * 3);
     let o = 0;
-    for (const { ring, mirror: withMirror } of spec) {
+    for (const { ring, mirror } of spec) {
       // Odd rings are staggered by half a pillar so history shows through the gaps of the ring in front.
       const offset = ring % 2 === 1 ? 0.5 : 0;
       for (let i = 0; i < layout.pillars; i++) {
-        const a = ((i + 0.5 + offset) / layout.pillars) % 1;
-        const rnd = (Math.sin(i * 12.9898 + ring * 78.233) * 43758.5453) % 1;
-        for (let mirror = 0; mirror < (withMirror ? 2 : 1); mirror++) {
-          data[o++] = a;
-          data[o++] = ring;
-          data[o++] = mirror;
-          data[o++] = Math.abs(rnd);
-        }
+        data[o++] = ((i + 0.5 + offset) / layout.pillars) % 1;
+        data[o++] = ring;
+        data[o++] = mirror;
       }
     }
-    geo.setAttribute('aData', new THREE.InstancedBufferAttribute(data, 4));
+    geo.setAttribute('aData', new THREE.InstancedBufferAttribute(data, 3));
     return total;
   }
 
@@ -369,6 +382,9 @@ export class SpectrumCathedral implements Preset {
 
   setOpacity(o: number): void {
     this.uniforms.uOpacity.value = o;
+    // the pillar pass is fully opaque (no blending, early-Z) except while a crossfade is running
+    this.solidMat.transparent = o < 0.999;
+    this.solidMat.depthWrite = true;
   }
 
   dispose(): void {
