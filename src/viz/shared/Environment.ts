@@ -102,7 +102,7 @@ export class Environment {
           float fine = (1.0 - min(min(g2.x, g2.y), 1.0)) * (1.0 - smoothstep(2.5, 5.0, r)) * 0.25;
           float gridFade = exp(-r * 0.045);
           // soft light pool under the user, breathing with bass
-          float pool = gauss(r, 1.5) * (0.10 + 0.22 * uBass);
+          float pool = gauss(r, 1.5) * (0.04 + 0.10 * uBass);
           // static concentric rings that give the floor scale, lifted by bass
           float rings = (gauss(r - 4.0, 0.10) + gauss(r - 7.0, 0.11) + gauss(r - 10.0, 0.12) + gauss(r - 14.0, 0.14)) * (0.05 + 0.08 * uBass);
           rings *= exp(-r * 0.035);

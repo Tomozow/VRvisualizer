@@ -10,11 +10,11 @@ const AGE_SPAN = 90;
 const CORE_Z = -3.2;
 const CORE_RADIUS = 0.8; // nearest surface is 2.4 m from the head
 const HALO_SIZE = 2.7; // half-size (m) of the soft halo sprite behind the core (its edge ramp reaches 0 exactly there)
-const HALO_BASE = 0.02; // resting halo brightness (bass and beat add to it)
+const HALO_BASE = 0.06; // resting halo brightness (bass and beat add to it)
 const REFLECTION = 0.2; // alpha of the floor reflection
 const QUALITY: Record<QualityLevel, { main: number; outer: number; far: number; segs: number }> = {
   low: { main: 16, outer: 10, far: 2, segs: 160 },
-  medium: { main: 24, outer: 14, far: 3, segs: 240 },
+  medium: { main: 14, outer: 10, far: 3, segs: 240 },
   high: { main: 24, outer: 14, far: 3, segs: 360 },
 };
 
@@ -199,7 +199,9 @@ void main() {
   float front = -P.z / max(length(P), 0.001);                               // 1 straight ahead (-Z)
   float fbias = outerLayer < 0.5 ? 0.6 + 0.4 * smoothstep(-0.6, 0.9, front) : 1.0;
   float near = smoothstep(1.4, 3.0, dist);
-  float alpha = (0.2 + 0.9 * e + 0.1 * uBeat) * tailFade * headSoft * (1.0 + 1.0 * headGlow * (1.0 - outerLayer)) * fbias * near * uBright;
+  float alpha = (0.12 + 0.9 * e + 0.1 * uBeat) * tailFade * headSoft * (1.0 + 1.0 * headGlow * (1.0 - outerLayer)) * fbias * near * uBright;
+  // ribbons passing between the listener and the core dim to 40 % so the core stays the brightest object
+  if (P.z > CORE.z && P.z < 0.0) alpha *= mix(0.4, 1.0, smoothstep(0.8, 2.2, length(P.xy)));
   vAlpha = alpha * mix(0.5, mix(0.5, 0.6, farLayer), outerLayer);
   vAlpha *= 1.0 + 0.9 * uBeat * headGlow;                                  // beat accent: the heads flare
   vAlpha *= mix(1.0, REFLECTION, mir);
@@ -307,7 +309,7 @@ void main() {
   col = mix(col, hotCol, hot);
   col = mix(col, uAccent, clamp(fres * 0.35, 0.0, 1.0));
   float pulse = 0.5 + 0.8 * uBass + 0.3 * uBeat;
-  float a = 0.1 * (0.22 + 0.55 * turb + 0.9 * hot + 1.6 * fres) * pulse * mix(1.0, ${REFLECTION.toFixed(1)}, vMirror);
+  float a = 0.26 * (0.22 + 0.55 * turb + 1.6 * hot + 1.6 * fres) * pulse * mix(1.0, ${REFLECTION.toFixed(1)}, vMirror);
   gl_FragColor = vec4(cheapOutputAdditive(col * (a * uBright * uOpacity)), 1.0);
 }
 `;

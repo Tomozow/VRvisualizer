@@ -63,6 +63,7 @@ varying float vTip; // metres below the pillar tip
 varying float vEnergy;
 varying float vRing;
 varying float vMirror;
+varying float vCeil;
 
 void main() {
   float ring = aData.y;
@@ -93,7 +94,7 @@ void main() {
   for (int k = 0; k < 6; k++) {
     int j = 2 * k;
     float ek = k == 0 ? e : clamp((raw[j] + raw[j + 1] + raw[j + 2]) * (1.0 / 3.0) * gain, 0.0, 1.25);
-    float hk = 0.2 + pow(ek, 1.4) * 6.0 * uIntensity * (1.0 + 0.1 * ring);
+    float hk = 0.2 + pow(max(ek, 0.3), 1.4) * 6.0 * uIntensity * (1.0 + 0.1 * ring);
     hk = hMax * tanh(hk / hMax);
     h = min(h, hk + RISE_PER_ROW * float(j));
   }
@@ -110,11 +111,13 @@ void main() {
     w *= 2.2; d *= 2.2; hh += 0.4;
   #endif
 
-  float sgn = 1.0 - 2.0 * mirror;
+  float sgn = mirror > 1.5 ? 1.0 : 1.0 - 2.0 * mirror;
   vec3 R = vec3(sin(theta), 0.0, -cos(theta));
   vec3 T = vec3(cos(theta), 0.0, sin(theta));
   float y = position.y * hh * sgn;
-  vec3 p = R * (radius - position.z * d) + T * (position.x * w * sgn + lean * y) + vec3(0.0, y, 0.0);
+  vec3 p = R * (radius - position.z * d - 0.18 * abs(y)) + T * (position.x * w * sgn + lean * y) + vec3(0.0, y, 0.0);
+  // mirror 2: a ceiling echo hanging from a 16 m vault at 40 % height (halo pass only)
+  if (mirror > 1.5) p.y = 16.0 - position.y * hh * 0.4;
   vec3 n = T * (normal.x * sgn) + vec3(0.0, normal.y * sgn, 0.0) - R * normal.z;
 
   vec4 wp = modelMatrix * vec4(p, 1.0);
@@ -125,7 +128,8 @@ void main() {
   vTip = (1.0 - position.y) * hh;
   vEnergy = e;
   vRing = ring;
-  vMirror = mirror;
+  vMirror = mirror > 1.5 ? 0.0 : mirror;
+  vCeil = step(1.5, mirror);
   gl_Position = projectionMatrix * viewMatrix * wp;
 }`;
 }
@@ -222,6 +226,7 @@ varying float vLocalY;
 varying float vEnergy;
 varying float vRing;
 varying float vMirror;
+varying float vCeil;
 
 void main() {
   vec3 N = normalize(vNormal);
@@ -240,14 +245,15 @@ void main() {
 
   float g = clamp(0.18 + y * 0.05 + vEnergy * 0.30 - vRing * 0.06, 0.0, 0.82);
   vec3 col = texture2D(uGradient, vec2(g, 0.5)).rgb * amt * alpha * uBrightness * (1.0 + uBeat * 0.35);
-  col *= mix(1.0, 0.3 * exp(-y * 0.5), vMirror) * uOpacity;
+  col *= mix(1.0, 0.3 * exp(-y * 0.5), vMirror) * mix(1.0, 0.5, vCeil) * uOpacity;
   gl_FragColor = vec4(cheapOutputAdditive(col), 1.0);
 }`;
 
 /** One block of instances: a ring, drawn either upright (mirror 0) or as its floor reflection (mirror 1). */
 interface InstanceSpec {
   ring: number;
-  mirror: 0 | 1;
+  /** 0 upright, 1 floor reflection, 2 ceiling echo (halo pass only) */
+  mirror: 0 | 1 | 2;
 }
 
 /**
@@ -329,7 +335,7 @@ export class SpectrumCathedral implements Preset {
     }));
 
     // Halo pass: the live ring (wider soft boxes, reflected) plus the ghost rings (no reflection), additive.
-    const haloSpec: InstanceSpec[] = [{ ring: 0, mirror: 0 }, { ring: 0, mirror: 1 }];
+    const haloSpec: InstanceSpec[] = [{ ring: 0, mirror: 0 }, { ring: 0, mirror: 1 }, { ring: 0, mirror: 2 }];
     for (let ring = SOLID_RINGS; ring < layout.rings; ring++) haloSpec.push({ ring, mirror: 0 });
     const halo = make(haloSpec, new THREE.ShaderMaterial({
       uniforms: this.uniforms,

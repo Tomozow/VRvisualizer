@@ -14,7 +14,7 @@ const BEAT_RING_MAX = 50; // metres
 const BEAT_RING_SPEED = 16; // metres per second
 const SKY_RADIUS = 80; // sun / haze cylinder
 const SKY_HEIGHT = 46; // tall enough that the sun's glow is never clipped by the cylinder rim
-const SUN_Y = 17; // high enough that the striped lower third (y 6..13 m) clears the far ridge line (~5 m at 80 m)
+const SUN_Y = 19; // high enough that the striped lower third (y 6..13 m) clears the far ridge line (~5 m at 80 m)
 const SUN_RADIUS = 11;
 
 const SEGMENTS: Record<string, [number, number]> = {
@@ -76,7 +76,7 @@ float terrainH(vec2 xz) {
   // single fetch from the pre-blurred history (5 bands wide, ~3 rows deep); far hills lose their detail below
   float e = clamp(histFreqSmooth(u, age) * (0.85 + 0.6 * u), 0.0, 1.3);
 
-  float taper = smoothstep(1.5, 6.0, r); // flat 1.5 m around the feet, full height by 6 m
+  float taper = smoothstep(1.5, 4.5, r); // flat 1.5 m around the feet, full height by 4.5 m
   float front = mix(0.65, 1.0, 1.0 - smoothstep(-8.0, 3.0, xz.y)); // strongest ahead (-Z)
   float mask = edgeMask(xz);
   float ampFade = 1.0 - 0.7 * smoothstep(40.0, 55.0, r); // far hills lose their spectral detail
@@ -85,15 +85,15 @@ float terrainH(vec2 xz) {
   float roll = sin(xz.x * 0.16 + uTime * 0.10) * sin(xz.y * 0.12 - uTime * 0.08) * 0.65
              + sin(xz.x * 0.07 + xz.y * 0.10 + uTime * 0.06) * 0.35;
   float far = mix(1.0, 2.6, smoothstep(12.0, 35.0, r)); // gentle swells nearby, mountains far away
-  float h = pow(e, 1.3) * 5.0 * uIntensity * front * ampFade + (0.9 + 0.9 * roll) * far;
-  h += uBass * 0.5 * smoothstep(4.0, 20.0, r); // the whole landscape swells with the bass
+  float h = pow(e, 1.1) * 8.0 * uIntensity * front * ampFade + (0.9 + 0.9 * roll) * far;
+  h += uBass * 1.2 * smoothstep(4.0, 20.0, r); // the whole landscape swells with the bass
 
   // swell travelling across the ground on every beat
   float sw = (r - uBeatRing) / 1.8;
   float swell = exp(-sw * sw) * (1.0 - clamp(uBeatRing / BEAT_RING_MAX, 0.0, 1.0));
-  h += swell * uBeatAmp * 0.55;
+  h += swell * uBeatAmp * 0.9;
   // soft height cap: never above 2.2 m within 12 m of the user (look slightly down onto the hills), up to 4 m far away
-  float cap = mix(2.2, 4.0, smoothstep(12.0, 30.0, r));
+  float cap = mix(2.8, 5.0, smoothstep(12.0, 30.0, r));
   h = cap * (1.0 - exp(-h / cap));
   return h * taper * mask;
 }
@@ -103,7 +103,7 @@ void main() {
   float lift = position.y;
   float h0 = terrainH(xz);
   #ifdef CEILING
-    h0 *= 0.4; // a faint 40 %-height echo
+    h0 *= 0.7; // a 70 %-height echo
     vec3 p = vec3(-xz.x, CEILING_Y - h0 - lift, xz.y);
   #else
     // normals from finite differences over 2 segments (0.6 m) keep the hills round instead of faceted
@@ -156,7 +156,8 @@ vec2 gridLines(vec2 p, float scale) {
   vec2 gp = p * scale;
   vec2 gw = fwidth(gp);
   vec2 gd = abs(fract(gp - 0.5) - 0.5) / max(gw, vec2(1e-4)); // pixels to the nearest line
-  return (1.0 - smoothstep(0.5, 1.5, gd)) * (1.0 - smoothstep(0.22, 0.55, gw));
+  // crisp 1 px line plus a soft 4 px halo so the grid blooms instead of reading as hard hairlines
+  return ((1.0 - smoothstep(0.5, 1.5, gd)) + 0.35 * (1.0 - smoothstep(0.5, 4.0, gd))) * (1.0 - smoothstep(0.22, 0.55, gw));
 }
 
 void main() {
@@ -169,10 +170,14 @@ void main() {
 
 #ifdef CEILING
   // mid-gradient colour, valleys at 20 % and crests at 40 % of a 0.18 base (the floor's body light is ~0.4)
-  vec3 col = texture2D(uGradient, vec2(clamp(0.3 + vH * 0.4, 0.0, 0.85), 0.5)).rgb * (0.18 * mix(0.2, 0.4, smoothstep(0.0, 1.2, vH)));
+  vec3 gradHi = texture2D(uGradient, vec2(clamp(0.3 + vH * 0.4, 0.0, 0.85), 0.5)).rgb;
+  vec3 col = gradHi * (0.30 * mix(0.35, 0.7, smoothstep(0.0, 1.2, vH)));
+  // a coarse 4 m grid gives the ceiling echo structure instead of a featureless wash
+  vec2 cg = gridLines(vWorld.xz, 0.25);
+  col += gradHi * max(cg.x, cg.y) * 0.4;
   col *= uBrightness * (0.85 + 0.3 * uLevel) * (1.0 + uBeat * 0.2);
   col = mix(col, uBackground, fog);
-  float vis = 1.0 - smoothstep(12.0, 40.0, r);
+  float vis = 1.0 - smoothstep(24.0, 60.0, r);
   gl_FragColor = vec4(cheapOutput(col), uOpacity * vis * vis * sqrt(max(vMask, 0.0)));
 #else
   vec3 N = normalize(vNormal);
@@ -191,7 +196,7 @@ void main() {
   // Grid pass: 1 m cells, brighter on peaks and near rows.
   vec2 gl = gridLines(vPlane, 1.0);
   float lines = max(gl.x * 0.7, gl.y);
-  float gain = (0.5 + 1.6 * smoothstep(0.0, 3.0, vH)) * (1.0 + 0.9 * exp(-dist / 14.0));
+  float gain = (0.7 + 1.6 * smoothstep(0.0, 3.0, vH)) * (1.0 + 0.9 * exp(-dist / 14.0));
   col += gradHi * lines * gain;
 
   // Near floor (never black): 0.25 m minor grid fading out by 4 m, a sun-reflection road running ahead (-Z),
@@ -273,7 +278,7 @@ void main() {
   vec3 sunCol = mix(core, uPrimary * 0.45, smoothstep(0.1, 1.0, dd)) * (0.8 + 0.2 * uBass);
   sunCol *= min(1.0, 0.9 / max(dot(sunCol, vec3(0.2126, 0.7152, 0.0722)), 1e-4)); // luma <= 0.9
   col += sunCol * disc * stripe;
-  col += uPrimary * 0.35 * exp(-max(dd - 1.0, 0.0) * 1.6) * ahead * (1.0 - disc) * (1.0 - smoothstep(1.0, 2.0, dd));
+  col += uPrimary * 0.35 * exp(-max(dd - 1.0, 0.0) * 1.6) * ahead * (1.0 - disc * stripe) * (1.0 - smoothstep(1.0, 2.0, dd));
 
   // tone curve kept (not the additive variant): the sun's luma cap is designed around it
   gl_FragColor = vec4(cheapOutput(col * uBrightness * uOpacity), 1.0);

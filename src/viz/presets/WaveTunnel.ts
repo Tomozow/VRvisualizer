@@ -25,7 +25,7 @@ const SEG_LINES = 48;
 /** `rings` = rows per side of the listener's plane; the tube has 2 * (rings - 1) + 1 rows. */
 const QUALITY: Record<QualityLevel, { rings: number; segs: number }> = {
   low: { rings: 64, segs: 96 },
-  medium: { rings: 96, segs: 160 },
+  medium: { rings: 96, segs: 224 },
   high: { rings: 128, segs: 192 },
 };
 
@@ -63,15 +63,15 @@ varying vec3 vColor;
 // Three taps one box-width apart (and +-4 frames apart in time) with 1-2-1 weights tile that gap-free into a rounded
 // profile, so nothing aliases into zig-zags and the polyline has no kinks.
 float waveSm(float u, float age) {
-  float a = histWaveSmooth(clamp(u - 0.047, 0.01, 0.99), age + 4.0);
+  float a = histWaveSmooth(clamp(u - 0.09, 0.01, 0.99), age + 8.0);
   float b = histWaveSmooth(clamp(u, 0.01, 0.99), age);
-  float c = histWaveSmooth(clamp(u + 0.047, 0.01, 0.99), max(age - 4.0, 0.0));
+  float c = histWaveSmooth(clamp(u + 0.09, 0.01, 0.99), max(age - 8.0, 0.0));
   return 0.25 * (a + c) + 0.5 * b;
 }
 float specSm(float band, float age) {
-  float a = histFreqSmooth(clamp(band - 0.039, 0.01, 0.99), age + 4.0);
+  float a = histFreqSmooth(clamp(band - 0.075, 0.01, 0.99), age + 8.0);
   float b = histFreqSmooth(clamp(band, 0.01, 0.99), age);
-  float c = histFreqSmooth(clamp(band + 0.039, 0.01, 0.99), max(age - 4.0, 0.0));
+  float c = histFreqSmooth(clamp(band + 0.075, 0.01, 0.99), max(age - 8.0, 0.0));
   return 0.25 * (a + c) + 0.5 * b;
 }
 
@@ -99,7 +99,7 @@ void main() {
 
   float calm = 0.35 + 0.65 * smoothstep(0.0, 6.0, ja);               // keep the mouth near the user round
   float flare = 1.2 * exp(-ja / 2.5);                                 // trumpet mouth: opens up around the user
-  float disp = tanh((1.7 * sp * (0.7 + 1.5 * band) - 0.3 + 0.25 * w) * uIntensity) * calm * (1.0 - 0.35 * jn);
+  float disp = tanh((1.7 * sp * (0.7 + 0.9 * band) - 0.3 + 0.15 * w) * uIntensity) * calm * (1.0 - 0.35 * jn);
   float r = 3.4 + flare + disp + 0.2 * uLevel + 0.35 * pulse;
   r = 0.5 * (r + 2.4 + sqrt((r - 2.4) * (r - 2.4) + 0.04));          // smooth max: never closer than 2.4 m, no creases
 
@@ -108,7 +108,7 @@ void main() {
 
   // near rows are dim and thin, mid/far rows carry the glow; the far end dissolves so rows never pop in or out
   vRamp = smoothstep(0.0, 22.0, ja);
-  vEnd = 1.0 - smoothstep(0.45 * RINGS, 1.0 * RINGS, ja);
+  vEnd = 1.0 - smoothstep(0.30 * RINGS, 1.0 * RINGS, ja);
   vFade = (0.15 + 0.85 * vRamp) * vEnd * mix(1.0, 0.7, back);        // strongest content stays in front
   vK = j - uScrollFrac;                                                // ring lines recede from the user at a constant rate
   vSeg = aSeg * SEG_LINES;
@@ -116,7 +116,7 @@ void main() {
   vDisp = abs(disp);
   vPulse = pulse;
   // near = top of the gradient (capped below white), far = primary; bass lifts a row up the gradient
-  float gc = clamp(mix(0.88, 0.3, pow(max(jn, 0.0), 0.6)) - 0.12 * back + 0.14 * bass, 0.0, 0.8);
+  float gc = clamp(mix(0.92, 0.12, sqrt(max(jn, 0.0))) - 0.12 * back + 0.25 * bass, 0.0, 0.9);
   vec3 gcol = texture2D(uGradient, vec2(gc, 0.5)).rgb;
   // palettes differ a lot in luminance (greens / cyans read ~2x brighter than reds / violets at the same value): partly even that out
   float lum = dot(gcol, vec3(0.2126, 0.7152, 0.0722));
@@ -150,8 +150,8 @@ float gridLine(float x, float hw, float soft, float glowAmt) {
   float fw = max(fwidth(x), 1e-5);
   float d = abs(fract(x + 0.5) - 0.5) / fw;
   float line = 1.0 - smoothstep(hw, hw + soft, d);
-  float band = 0.25 * (1.0 - smoothstep(0.0, 2.5, d));
-  float tail = exp(-d * 0.7) * glowAmt;
+  float band = 0.5 * (1.0 - smoothstep(0.0, 5.0, d));
+  float tail = exp(-d * 0.35) * glowAmt;
   // lines crowding together (small spacing, large fw) dim first so the converging far field stays a calm glow, then the moire fade removes them
   float crowd = 1.0 - 0.7 * smoothstep(0.02, 0.16, fw);
   return (line + band + tail) * crowd * (1.0 - smoothstep(0.18, 0.40, fw));
@@ -159,21 +159,23 @@ float gridLine(float x, float hw, float soft, float glowAmt) {
 
 void main() {
   // fine lines near the user, more body (up to a 0.9 px half width) further down the tunnel
-  float hw = mix(0.55, 0.9, vRamp);
+  float hw = mix(0.7, 1.3, vRamp);
   float soft = mix(0.6, 1.0, vRamp);
-  float glowAmt = mix(0.04, 0.12, vRamp);
+  float glowAmt = mix(0.15, 0.35, vRamp);
   float ringL = gridLine(vK, hw, soft, glowAmt);
   float segL = gridLine(vSeg, hw * 0.85, soft, glowAmt);
   float lines = max(ringL, 0.45 * segL);
   // quiet base, bass rings stand out (squared so the contrast is kept while the average comes down); about 45 % dimmer
   // than the first version, which read as a uniformly bright full-field grid
-  float energy = 0.02 + 0.25 * vBass * vBass + 0.07 * vDisp;
+  float energy = 0.06 + 0.35 * vBass * vBass + 0.10 * vDisp;
   // the dark surface is lit at bass rings so the lines sit in light, not on black
   // only the strongest bass rows light the surface, and only faintly: the space between lines must stay near black
   float ring = smoothstep(0.72, 0.96, vBass);
   vec3 col = vColor * (lines * energy + 0.018 * (0.4 + vBass) * ring * ring);
   // beat pulse ring travelling away from the user stays the bright accent
   col += mix(vColor, uAccent, 0.5) * vPulse * (0.03 + 0.24 * lines);
+  // hot core where lines are strongest so the wireframe blooms instead of reading as flat hairlines
+  col += uAccent * (lines * lines * lines) * 0.25 * vBass * vFade;
   col = min(col * (vFade * uBright), vec3(0.9));   // never let a line reach full white before the output curve
   float volume = 0.7 * vEnd * uOpacity;
   gl_FragColor = vec4(cheapOutput(col * uOpacity + uBg * (0.15 * volume)), volume);

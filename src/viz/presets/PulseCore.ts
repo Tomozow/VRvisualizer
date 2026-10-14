@@ -23,7 +23,7 @@ const CORONA_SCALE = 0.85;
 
 const QUALITY = {
   low: { freq: 24, swarm: 1500, sparks: 100 },
-  medium: { freq: 48, swarm: 3000, sparks: 150 },
+  medium: { freq: 48, swarm: 7000, sparks: 150 },
   high: { freq: 64, swarm: 4500, sparks: 220 },
 } as const;
 
@@ -219,7 +219,7 @@ void main() {
   float glow = pow(fall, 2.4) * (1.0 - smoothstep(0.65, 1.0, dn)); // the window ends the (sub-level) tail smoothly at the edge
   float pulse = mix(1.0, 0.45 + 1.1 * uBass, vCor.z); // the back corona swells with the bass
   vec3 col = uPrimary * glow * (0.3 + 0.4 * uLevel) * vCor.y * pulse;
-  col += mix(uAccent, uPrimary, 0.3) * (f2 * f2) * uBeat * 0.35 * vCor.y; // inner flash on the beat
+  col += mix(uAccent, uPrimary, 0.3) * (f2 * f2) * uBeat * 0.22 * vCor.y; // inner flash on the beat
   gl_FragColor = vec4(cheapOutputAdditive(col * uBrightness * uOpacity), 1.0);
 }`;
 
@@ -307,7 +307,7 @@ void main() {
   float ring = exp(-ed * ed);
   float wake = smoothstep(0.0, 0.06, d) * exp(-d * 4.0) * 0.06 * (1.0 - smoothstep(${(SHOCK_BAND * 0.5).toFixed(2)}, ${SHOCK_BAND.toFixed(2)}, d));
   float life = pow(clamp(1.0 - vAge, 0.0, 1.0), 1.3);
-  vec3 col = uAccent * (ring * 1.9 + wake);
+  vec3 col = uAccent * (ring * 1.3 + wake);
   col *= min(1.0, 1.1 / max(max(col.r, max(col.g, col.b)), 1e-4)); // stay saturated instead of washing out to white
   col *= life * vPower * uBrightness * uOpacity * smoothstep(${CLEAR_NEAR.toFixed(1)}, ${CLEAR_FAR.toFixed(1)}, distance(vWorld, cameraPosition));
   gl_FragColor = vec4(cheapOutputAdditive(col), 1.0);
@@ -392,7 +392,7 @@ void main() {
     float sr = sqrt(1.0 - cu * cu);
     vec3 dir = vec3(sr * cos(ph), cu, sr * sin(ph));
     if (s.w < 0.35) dir.z = abs(dir.z); // a third of the dust is folded behind the listener: ~2/3 of it fills the back
-    float rad = (5.0 + 17.0 * s.x) * (1.0 + 0.03 * uBass + 0.04 * uBeat);
+    float rad = (4.0 + 14.0 * s.x) * (1.0 + 0.03 * uBass + 0.04 * uBeat);
     p = vec3(0.0, 1.6, 0.0) + dir * rad;
     p.y = abs(p.y - 0.3) + 0.3; // stay above the floor
     vec3 np = p * 0.12;
@@ -558,7 +558,7 @@ export class PulseCore implements Preset {
     this.coronaU = { ...shared(), uSizeBoost: { value: 0 }, uBass: { value: 0 } };
     const coronaGeo = new THREE.CircleGeometry(0.5, 24);
     // instance 0: behind the core (11 m wide); instance 1: dim and bass-pulsed behind the listener (9 m, 0.35x)
-    coronaGeo.setAttribute('aCor', new THREE.InstancedBufferAttribute(new Float32Array([11, 0.75, 0, 9, 0.35 * 0.75, 1]), 3));
+    coronaGeo.setAttribute('aCor', new THREE.InstancedBufferAttribute(new Float32Array([11, 0.75, 0, 14, 0.6 * 0.75, 1]), 3));
     const coronaMat = new THREE.ShaderMaterial({
       uniforms: this.coronaU,
       vertexShader: CORONA_VERTEX,
@@ -657,9 +657,9 @@ export class PulseCore implements Preset {
     const mid = Math.min(1.2, f.mid * p.intensity);
     const treble = Math.min(1.2, f.treble * p.intensity);
     const level = Math.min(1, f.level);
-    const beat = f.beatEnv * k;
+    const beat = f.beatEnv * k * 0.8;
     const bright = 0.6 + 0.4 * p.glow;
-    this.orbit += dt * p.speed * (0.35 + 1.8 * Math.min(1, f.highMid * p.intensity));
+    this.orbit += dt * p.speed * (0.25 + 0.35 * Math.min(1, f.highMid * p.intensity));
 
     for (const u of this.allUniforms) {
       u.uTime.value = this.time;
@@ -669,7 +669,7 @@ export class PulseCore implements Preset {
     }
     this.coreU.uBass.value = bass;
     this.coreU.uTreble.value = treble;
-    this.coronaU.uSizeBoost.value = 1.2 * level + 0.8 * beat;
+    this.coronaU.uSizeBoost.value = 0.5 * beat;
     this.coronaU.uBass.value = Math.min(1, bass);
     this.ringU.uMid.value = Math.min(1, mid);
     this.swarmU.uOrbit.value = this.orbit;
