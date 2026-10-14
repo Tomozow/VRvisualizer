@@ -82,14 +82,18 @@ directly. `playback` is replaced by reference on every engine change.
 * World-space panel ≈ 1.4 m × 0.89 m, 1.4 m in front of the head at ≈1.3 m height, slight downward tilt toward the face.
   Rendered with a CanvasTexture (2048×1304) redrawn only when state changes; hover, sliders and live readouts are GPU overlay quads.
   Body text ≥ 44 px (≈1.2° at 1.4 m), hit targets ≥ 4 cm.
-  Tabs: Player (now playing, progress/seek, transport, volume, queue), Scenes (preset tiles + palette chips + intensity/
-  speed/glow sliders + auto-cycle), Sources (Mic on/off, Demo, YouTube/queue info, hint text), Settings (recenter, fps,
-  background toggle, exit VR).
+  Tabs: Player (now playing, progress/seek, transport, volume, queue; a Controls card while the queue is short), Scenes
+  (preset tiles + palette chips + Intensity / Speed / Glow sliders + Auto-cycle + Aurora sky), Sources (Microphone with
+  live level meter, Demo track, YouTube status, analysis-input status), Settings (Quality Low/Medium/High, Recenter,
+  Hide menu, Auto-hide toggle, Enter/Exit VR, small FPS label).
 * Interaction: ray from each controller (and index-finger pinch for hands) → raycast against the panel → hover highlight;
   trigger/pinch = click, drag on sliders. Thumbstick: left/right = prev/next preset, up/down = volume; A/X = play/pause;
   B/Y = toggle menu; grip held = grab & move the panel. Haptic pulse on click (`gamepad.hapticActuators`).
-* Panel hides automatically after 12 s without interaction while playing (configurable); any button press shows it again.
-  A small always-visible mini-HUD (track title + beat dot) can live at the bottom edge, fading out after 4 s.
+* Panel auto-hides after 12 s without interaction while playing — only after the first interaction and never within the
+  first 30 s of a session; the first three auto-hides toast how to bring it back. Trigger, grip and B/Y reveal it; A/X
+  and the thumbstick act without revealing (feedback by toast). B/Y long-press (≥ 600 ms) recenters; a ✕ in the header
+  and a Settings row hide it for hand-tracking users. A head-anchored mini-HUD (title, beat dot, "B/Y · MENU" keycap,
+  "No sound heard" state) and toasts sit ≈ 10° below the gaze and follow the head lazily.
 * Controllers: `XRControllerModelFactory` models + a thin glowing ray that shortens to the hit point; hands via
   `XRHandModelFactory` ('mesh'). Everything must survive sessions starting/ending repeatedly.
 * `recenter()` re-places the panel in front of the current head pose (use `renderer.xr.getCamera()` world position/direction
