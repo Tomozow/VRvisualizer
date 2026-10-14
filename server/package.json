@@ -1,0 +1,9 @@
+{
+  "name": "resonance-vr-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional self-hosted YouTube audio proxy for Resonance VR (personal use). Needs yt-dlp; ffmpeg is optional.",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node proxy.mjs" }
+}

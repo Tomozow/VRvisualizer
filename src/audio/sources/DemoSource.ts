@@ -27,7 +27,6 @@ class Graph {
   readonly duck: GainNode;
   readonly padFilter: BiquadFilterNode;
   readonly padOscs: OscillatorNode[] = [];
-  readonly padBase: number[] = [];
   readonly delayIn: GainNode;
   private noise: AudioBuffer;
   private seed = 12345;
@@ -36,7 +35,7 @@ class Graph {
   constructor(readonly ctx: AudioContext, dest: AudioNode) {
     const mk = <T extends AudioNode>(n: T): T => { this.nodes.push(n); return n; };
     this.out = mk(ctx.createGain());
-    this.out.gain.value = 0.9;
+    this.out.gain.value = 0.8;
     const comp = mk(ctx.createDynamicsCompressor());
     comp.threshold.value = -14; comp.ratio.value = 4; comp.attack.value = 0.005; comp.release.value = 0.15;
     comp.connect(this.out);
@@ -179,6 +178,7 @@ export class DemoSource {
   start(): void {
     if (this.g) return;
     this.g = new Graph(this.ctx, this.dest);
+    this.g.setChord(CHORDS[(Math.floor(this.step / 16) % CYCLE_BARS) >> 1], this.ctx.currentTime);
     this.nextTime = this.ctx.currentTime + 0.08;
     this.tick();
     this.timer = window.setInterval(() => this.tick(), 40);
@@ -223,7 +223,7 @@ export class DemoSource {
     if (s === 0 && bar % 2 === 0) g.setChord(chord, t);
 
     if (s % 4 === 0) g.kick(t);
-    if (bar >= 2 && bar < 15 || bar === 15 && s < 8) {
+    if ((bar >= 2 && bar < 15) || (bar === 15 && s < 8)) {
       if (s === 2 || s === 6 || s === 10 || s === 14) g.bass(t, chord.bass, 0.2);
       else if (s === 7 && bar % 4 === 3) g.bass(t, chord.bass + 12, 0.1);
       else if (s === 11 && bar % 4 === 3) g.bass(t, chord.bass + 7, 0.1);

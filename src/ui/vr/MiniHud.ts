@@ -95,7 +95,10 @@ export class MiniHud {
 
   private trackId: string | null = null;
   private trackChangedAt = -1e9;
-  private titleKey = '';
+  private shownTrackId: string | null = null;
+  private shownTitle = '';
+  private shownArtist: string | undefined = '';
+  private shownAccent = '';
   private toastRef: object | null = null;
   private toastText = '';
   private toastUntil = 0;
@@ -132,9 +135,14 @@ export class MiniHud {
     const fresh = now - this.trackChangedAt < SHOW_AFTER_TRACK_CHANGE_MS;
     const wantHud = f.enabled && !!track && ((pb.playing && !f.menuVisible) || fresh);
     if (track && (wantHud || this.hud.opacity > 0.01)) {
-      const key = `${track.id}|${track.title}|${track.artist ?? ''}|${f.accent.mainCss}`;
-      if (key !== this.titleKey) {
-        this.titleKey = key;
+      if (
+        track.id !== this.shownTrackId || track.title !== this.shownTitle || track.artist !== this.shownArtist ||
+        f.accent.mainCss !== this.shownAccent
+      ) {
+        this.shownTrackId = track.id;
+        this.shownTitle = track.title;
+        this.shownArtist = track.artist;
+        this.shownAccent = f.accent.mainCss;
         this.drawHud(track.title, track.artist || KIND_LABEL[track.kind], f.accent);
       }
     }
@@ -203,10 +211,6 @@ export class MiniHud {
     strokeRound(ctx, px + 1.5, 13.5, pw - 3, TOAST_PX_H - 27, 39, a.glow, 3);
     drawText(ctx, label, TOAST_PX_W / 2, TOAST_PX_H / 2 + 2, 46, COLOR.text, { weight: 700, align: 'center', baseline: 'middle' });
     this.toast.upload();
-  }
-
-  setVisible(v: boolean): void {
-    this.group.visible = v && this.group.visible;
   }
 
   dispose(): void {

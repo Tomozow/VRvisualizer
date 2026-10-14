@@ -66,7 +66,7 @@ function circleButton(env: TabEnv, o: CircleBtn): void {
     ctx.stroke();
   }
   const ink = o.primary ? a.ink : o.active ? a.mainCss : COLOR.text;
-  if (o.seek) drawSeekIcon(ctx, o.seek, o.cx, o.cy, o.r * 1.15, ink);
+  if (o.seek) drawSeekIcon(ctx, o.seek, o.cx, o.cy, o.r * 1.78, ink);
   else if (o.icon) drawIcon(ctx, o.icon, o.cx, o.cy, o.r * (o.primary ? 1.0 : 0.95), ink);
   ctx.restore();
   if (!o.disabled && o.click) hit(env, o.key, o.cx - o.r - 8, o.cy - o.r - 8, (o.r + 8) * 2, (o.r + 8) * 2, o.r + 8, o.click);
@@ -219,11 +219,11 @@ export function drawPlayer(env: TabEnv): void {
   const ty0 = 752;
   const can = queue.length > 0 || !!track;
   circleButton(env, { key: 'shuffle', cx: cx - 430, cy: ty0, r: 48, icon: 'shuffle', active: pb.shuffle, click: () => act.setShuffle(!pb.shuffle) });
-  circleButton(env, { key: 'back10', cx: cx - 290, cy: ty0, r: 50, seek: -1, disabled: !seekable, click: () => act.seekBy(-10) });
+  circleButton(env, { key: 'back10', cx: cx - 290, cy: ty0, r: 54, seek: -1, disabled: !seekable, click: () => act.seekBy(-10) });
   circleButton(env, { key: 'prev', cx: cx - 160, cy: ty0, r: 56, icon: 'prev', disabled: !can, click: () => act.prev() });
   circleButton(env, { key: 'toggle', cx, cy: ty0, r: 84, icon: pb.playing ? 'pause' : 'play', primary: true, disabled: !can, click: () => act.toggle() });
   circleButton(env, { key: 'next', cx: cx + 160, cy: ty0, r: 56, icon: 'next', disabled: !can, click: () => act.next() });
-  circleButton(env, { key: 'fwd10', cx: cx + 290, cy: ty0, r: 50, seek: 1, disabled: !seekable, click: () => act.seekBy(10) });
+  circleButton(env, { key: 'fwd10', cx: cx + 290, cy: ty0, r: 54, seek: 1, disabled: !seekable, click: () => act.seekBy(10) });
   const nextRepeat = pb.repeat === 'off' ? 'all' : pb.repeat === 'all' ? 'one' : 'off';
   circleButton(env, {
     key: 'repeat', cx: cx + 430, cy: ty0, r: 48, icon: pb.repeat === 'one' ? 'repeatOne' : 'repeat',
@@ -392,7 +392,7 @@ export function drawScenes(env: TabEnv): void {
     }
     ctx.font = font(48, 800);
     drawText(ctx, fitText(ctx, p.name, TW - 60 - (active ? 180 : 70)), x + 32, y + 66, 48, COLOR.text, { weight: 800 });
-    if (active) drawText(ctx, 'ACTIVE', x + TW - 32, y + 62, 34, a.mainCss, { weight: 800, align: 'right', spacing: 3 });
+    if (active) drawText(ctx, 'ACTIVE', x + TW - 32, y + 62, 36, a.mainCss, { weight: 800, align: 'right', spacing: 3 });
     else drawText(ctx, String(idx + 1).padStart(2, '0'), x + TW - 32, y + 62, 36, COLOR.textFaint, { weight: 800, align: 'right' });
     ctx.font = font(36, 500);
     wrapText(ctx, p.description, TW - 64, 2).forEach((ln, i) => drawText(ctx, ln, x + 32, y + 118 + i * 42, 36, COLOR.textDim, { weight: 500 }));

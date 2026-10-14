@@ -22,8 +22,9 @@ export class ElementPlayer {
   private offset = 0;         // seconds already skipped by restarting a proxy stream
   private knownDuration = 0;  // used when the element reports Infinity/NaN (live-style streams)
   private loaded = false;
+  private seekable = true;      // proxied streams from a proxy without ffmpeg cannot restart at an offset
 
-  constructor(private events: ElementEvents) {
+  constructor(events: ElementEvents) {
     const el = new Audio();
     el.crossOrigin = 'anonymous';
     el.preload = 'auto';
@@ -50,13 +51,12 @@ export class ElementPlayer {
     return Number.isFinite(d) ? this.offset + d : this.knownDuration;
   }
 
-  get hasSource(): boolean { return this.loaded; }
-
   load(url: string, kind: ElementKind, knownDuration = 0): void {
     this.kind = kind;
     this.base = kind === 'proxy' ? url : '';
     this.offset = 0;
     this.knownDuration = knownDuration;
+    this.seekable = true;
     this.loaded = true;
     this.el.src = url;
     this.el.load();
@@ -65,6 +65,8 @@ export class ElementPlayer {
   setKnownDuration(seconds: number): void {
     if (seconds > 0) this.knownDuration = seconds;
   }
+
+  setSeekable(seekable: boolean): void { this.seekable = seekable; }
 
   async play(): Promise<void> {
     if (!this.loaded) return;
@@ -81,18 +83,25 @@ export class ElementPlayer {
 
   pause(): void { this.el.pause(); }
 
-  seek(seconds: number): void {
+  /** @returns false when the source cannot seek */
+  seek(seconds: number): boolean {
     const s = Math.max(0, seconds);
     if (this.kind === 'proxy') {
       // proxied streams are not seekable: restart the stream at the requested offset
+      if (!this.seekable) return false;
       const wasPlaying = !this.el.paused;
       this.offset = s;
       this.el.src = `${this.base}${this.base.includes('?') ? '&' : '?'}t=${Math.floor(s)}`;
       this.el.load();
       if (wasPlaying) void this.play().catch(() => undefined);
-      return;
+      return true;
     }
-    try { this.el.currentTime = this.duration > 0 ? Math.min(s, this.duration) : s; } catch { /* not seekable yet */ }
+    try {
+      this.el.currentTime = this.duration > 0 ? Math.min(s, this.duration) : s;
+      return true;
+    } catch {
+      return false; // no metadata yet
+    }
   }
 
   /** Stop and release the network connection */

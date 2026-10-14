@@ -7,7 +7,8 @@ Immersive music visualizer & player for **Meta Quest 2** (and any WebXR browser)
 * 🎛 World-space VR panel (laser pointer, thumbsticks, hand tracking) and a 2D overlay for setup
 * ⚡ Tuned for Quest 2: instanced / GPU-side geometry, ≤ a handful of draw calls per scene, no post-processing
 
-See `docs/ARCHITECTURE.md` for the design, `server/README.md` for the optional YouTube proxy.
+Docs: `docs/QUEST.md` (how to use it on the headset) · `docs/ARCHITECTURE.md` (design & contracts) ·
+`docs/QUALITY_BAR.md` (review criteria) · `server/README.md` (optional YouTube audio proxy).
 
 ## Quick start
 ```bash
@@ -17,6 +18,13 @@ npm run build      # static site in dist/
 ```
 On the headset the page must be served over **HTTPS** (GitHub Pages works out of the box; locally use a tunnel such as
 `cloudflared tunnel --url http://localhost:5173` or `vite --https` with a trusted certificate).
+
+## Tests
+```bash
+npm run typecheck          # TypeScript
+npm test                   # build + headless Chromium: screenshots of every scene, emulated Quest 2 XR session
+                           # (IWER) with controller input, and a 60 Hz audio-feature sanity check → tests/out/
+```
 
 ## Using it on Quest 2
 1. Open the site in the Quest browser. Add music: drop files, paste a YouTube link / playlist or a direct audio URL, or turn on the microphone.

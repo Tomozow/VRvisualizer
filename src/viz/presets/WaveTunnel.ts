@@ -6,7 +6,7 @@ import { HISTORY_GLSL } from '@/viz/shared/AudioTextures';
 const TAU = Math.PI * 2;
 const EYE = 1.6;
 const RING_SPACING = 0.4; // metres between rings
-const FIRST_RING = 2.0; // nearest ring is 2 m from the head
+const FIRST_RING = 0.8; // nearest ring is 0.8 m along the axis (and >= 2.4 m radially) from the head
 /** Frames of audio history spread over the whole tunnel length (256 rows are available). */
 const AGE_SPAN = 200;
 /** Rings slide toward the user at RING_RATE * RING_SPACING m/s (kept far below the comfort limit). */
@@ -48,19 +48,31 @@ varying float vPulse;
 varying vec3 vColor;
 
 // Raw waveform frames decorrelate quickly (no trigger alignment) and carry far more detail than the tube can
-// show, so low-pass hard: 9 taps over angle (triangular) x 3 taps over a few frames.
+// show, so low-pass it. The taps are spaced exactly 2 texels apart (one bilinear tap covers 2), so the box is gap-free
+// and nothing aliases into zig-zags: 12 taps (~0.09 of the circle, triangular) x 2 frames.
 float waveSmooth(float u, float age) {
   float s = 0.0, ws = 0.0;
-  for (int i = -4; i <= 4; i++) {
-    float wi = 5.0 - abs(float(i));
-    for (int t = -1; t <= 1; t++) {
-      s += wi * histWave(clamp(u + float(i) * 0.02, 0.01, 0.99), max(age + float(t) * 3.0, 0.0));
-      ws += wi;
-    }
+  for (int i = 0; i < 12; i++) {
+    float k = float(i) - 5.5;
+    float wi = 6.5 - abs(k);
+    float uu = clamp(u + k * 0.0078125, 0.01, 0.99);
+    s += wi * (histWave(uu, age) + histWave(uu, age + 4.0));
+    ws += 2.0 * wi;
   }
   return s / ws;
 }
-float spec(float u, float age) { return histFreq(clamp(u, 0.01, 0.99), age); }
+// Same idea for the spectrum: 8 taps x 2 bands = 16 bands, +-4 frames, so single hot bands become rounded bulges.
+float specSmooth(float b, float age) {
+  float s = 0.0, ws = 0.0;
+  for (int i = 0; i < 8; i++) {
+    float k = float(i) - 3.5;
+    float wi = 4.5 - abs(k);
+    float bb = clamp(b + k * 0.015625, 0.01, 0.99);
+    s += wi * (histFreq(bb, max(age - 4.0, 0.0)) + histFreq(bb, age) + histFreq(bb, age + 4.0));
+    ws += 3.0 * wi;
+  }
+  return s / ws;
+}
 
 void main() {
   float k = aRing * (RINGS - 1.0);
@@ -71,18 +83,18 @@ void main() {
   // waveform of this ring's age, mirrored around the tube so the seam closes
   float u = abs(aSeg * 2.0 - 1.0);
   float w = waveSmooth(u, age);
-  // spectrum of the same age wrapped around the tube: bass at the sides, treble top and bottom (smooth: sin^2)
+  // spectrum (lower 60 %) of the same age wrapped around the tube: bass at the sides, highs top and bottom (smooth: sin^2)
   float sn = sin(aSeg * 6.2831853);
-  float band = 0.04 + 0.92 * sn * sn;
-  float sp = 0.25 * (spec(band - 0.04, age) + 2.0 * spec(band, age) + spec(band + 0.04, age));
+  float band = 0.03 + 0.57 * sn * sn;
+  float sp = specSmooth(band, age);
   float bass = histFreq(0.08, age);
 
   float dp = (jn - uBeatPos) / 0.04;
   float pulse = uBeatAmp * exp(-dp * dp);
 
   float calm = 0.35 + 0.65 * smoothstep(0.0, 6.0, j);                // keep the mouth near the user round
-  float flare = 1.8 * exp(-j / 2.5);                                  // trumpet mouth: opens up toward the user
-  float disp = tanh((1.7 * sp * (0.7 + 0.9 * band) - 0.3 + 0.45 * w) * uIntensity) * calm * (1.0 - 0.35 * jn);
+  float flare = 1.2 * exp(-j / 2.5);                                  // trumpet mouth: opens up toward the user
+  float disp = tanh((1.7 * sp * (0.7 + 1.5 * band) - 0.3 + 0.25 * w) * uIntensity) * calm * (1.0 - 0.35 * jn);
   float r = 3.4 + flare + disp + 0.2 * uLevel + 0.35 * pulse;
   r = max(r, 2.4);
 
@@ -90,7 +102,7 @@ void main() {
   vec3 p = vec3(cos(th) * r, EYE + sin(th) * r, -(FIRST + j * SPACING) * uFlip);
 
   // near-end and far-end dissolve so rings never pop in or out
-  vFade = smoothstep(0.5, 10.0, j) * (1.0 - smoothstep(0.6 * RINGS, 1.0 * RINGS, j));
+  vFade = (0.3 + 0.7 * smoothstep(0.0, 8.0, j)) * (1.0 - smoothstep(0.6 * RINGS, 1.0 * RINGS, j));
   vK = k;
   vSeg = aSeg * SEGS;
   vBass = bass;

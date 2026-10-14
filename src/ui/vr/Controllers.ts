@@ -77,9 +77,8 @@ export class XRPointer {
 }
 
 interface Entry {
-  controller: THREE.Object3D & { visible: boolean };
-  grip: THREE.Object3D;
-  hand: ReturnType<THREE.WebGLRenderer['xr']['getHand']>;
+  controller: THREE.XRTargetRaySpace;
+  hand: THREE.XRHandSpace;
   ray: RayVisual;
   cleanup: (() => void)[];
 }
@@ -242,7 +241,7 @@ export class Controllers {
         () => controller.removeEventListener('squeezestart', onSqueezeStart),
         () => controller.removeEventListener('squeezeend', onSqueezeEnd),
       );
-      this.entries.push({ controller, grip, hand, ray, cleanup });
+      this.entries.push({ controller, hand, ray, cleanup });
     }
 
     this.onSessionStart = () => {
@@ -278,7 +277,7 @@ export class Controllers {
   update(dt: number): void {
     if (!this.renderer.xr.isPresenting) return;
     for (let i = 0; i < 2; i++) this.readPose(this.pointers[i], this.entries[i]);
-    for (let i = 0; i < 2; i++) this.readButtons(this.pointers[i], this.entries[i], dt);
+    for (let i = 0; i < 2; i++) this.readButtons(this.pointers[i], dt);
   }
 
   private readPose(p: XRPointer, e: Entry): void {
@@ -321,7 +320,7 @@ export class Controllers {
     p.hasRay = true;
   }
 
-  private readButtons(p: XRPointer, _e: Entry, dt: number): void {
+  private readButtons(p: XRPointer, dt: number): void {
     const src = p.inputSource;
     if (!p.connected || !src) return;
     const h = this.handlers;

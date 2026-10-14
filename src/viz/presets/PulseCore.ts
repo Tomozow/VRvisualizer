@@ -5,7 +5,7 @@ import type { Preset, PresetContext, VizParams } from '@/viz/types';
 const CORE_POS = new THREE.Vector3(0, 1.6, -3); // 3 m ahead at eye height
 const CORE_RADIUS = 1.2;
 const SHOCK_SLOTS = 6;
-const SHOCK_LIFE = 1.4; // seconds
+const SHOCK_LIFE = 1.2; // seconds
 const SHOCK_R0 = 1.3;
 const SHOCK_R_WALL = 10; // upright ring facing the user
 const SHOCK_R_FLOOR = 24; // ring on the floor, so the room behind you pulses too
@@ -81,6 +81,8 @@ uniform float uBeat;
 uniform float uLevel;
 varying vec3 vNormal;
 varying vec3 vWorld;
+varying vec3 vDir;
+varying vec3 vBase;
 varying float vDisp;
 
 float displace(vec3 n) {
@@ -90,7 +92,7 @@ float displace(vec3 n) {
   float ripple = snoise(n * 8.5 + vec3(0.0, t * 1.5, t * 1.1));
   float spike = pow(max(snoise(n * 3.2 + vec3(t * 0.5)), 0.0), 2.0);
   float d = lobes * (0.07 + 0.30 * uBass) + body * (0.03 + 0.08 * uMid)
-          + ripple * (0.008 + 0.055 * uTreble) + spike * uBeat * 0.22;
+          + ripple * (0.006 + 0.04 * uTreble) + spike * uBeat * 0.22;
   return clamp(d, -0.45, 0.55); // keeps the surface > 1 m from the listener
 }
 
@@ -112,46 +114,53 @@ void main() {
   vec4 wp = modelMatrix * vec4(p0, 1.0);
   vWorld = wp.xyz;
   vNormal = mat3(modelMatrix) * nrm;
+  vDir = n;
+  vBase = mat3(modelMatrix) * n;
   vDisp = d0;
   gl_Position = projectionMatrix * viewMatrix * wp;
 }`;
 
 const CORE_FRAGMENT = /* glsl */ `
+${SIMPLEX_GLSL}
 uniform sampler2D uGradient;
 uniform vec3 uAccent;
+uniform vec3 uPrimary;
+uniform vec3 uBackground;
+uniform float uTime;
 uniform float uOpacity;
 uniform float uBrightness;
 uniform float uBeat;
-uniform float uLevel;
+uniform float uBass;
 varying vec3 vNormal;
 varying vec3 vWorld;
+varying vec3 vDir;
+varying vec3 vBase;
 varying float vDisp;
 
 void main() {
   vec3 N = normalize(vNormal);
   vec3 V = normalize(cameraPosition - vWorld);
-  float ndv = clamp(dot(N, V), 0.0, 1.0);
-  float fres = pow(1.0 - ndv, 2.6);
-
-  // Displacement drives the colour: valleys cool and dark, ridges hot.
-  float dn = clamp(vDisp * 1.6 + 0.5, 0.0, 1.0);
-  vec3 base = texture2D(uGradient, vec2(clamp(0.08 + 0.8 * dn + 0.1 * uLevel, 0.0, 1.0), 0.5)).rgb;
-  vec3 hot = texture2D(uGradient, vec2(clamp(0.6 + 0.4 * dn, 0.0, 1.0), 0.5)).rgb;
-
+  // rim from mostly-detailed normals (the smooth sphere normal alone would light the whole outer lumps)
+  vec3 Nb = normalize(vBase);
+  float ndv = clamp(dot(normalize(mix(Nb, N, 0.75)), V), 0.0, 1.0);
   vec3 L = normalize(vec3(0.4, 0.7, 0.6));
-  float lam = 0.5 + 0.5 * dot(N, L);
-  // fake subsurface: light bleeding through the body where we look straight at it
-  float sss = pow(1.0 - fres, 3.0) * (0.3 + 0.7 * dn);
-  vec3 col = base * (0.16 + 0.5 * lam) + base * sss * 0.8;
 
-  // iso-displacement contour lines
-  float ch = vDisp * 16.0;
-  float cw = fwidth(ch);
-  float contour = (1.0 - smoothstep(0.0, cw * 1.5 + 0.03, min(fract(ch), 1.0 - fract(ch)))) * (1.0 - smoothstep(0.4, 1.0, cw));
-  col += hot * contour * 0.5;
+  // A dark sphere of energy: near-black body, emissive ridges, glowing veins, bright rim.
+  float dn = clamp(vDisp * 1.6 + 0.5, 0.0, 1.0);
+  vec3 col = uBackground * 1.6 * (0.5 + 0.5 * max(dot(N, L), 0.0));
+  vec3 grad = texture2D(uGradient, vec2(clamp(0.1 + 0.8 * dn, 0.0, 1.0), 0.5)).rgb;
+  col += grad * (0.4 + 0.7 * uBass) * (0.15 + 0.85 * pow(dn, 1.5));
 
-  col += hot * pow(dn, 3.0) * 0.9;
-  col += mix(uAccent, vec3(1.0), 0.3) * fres * (1.0 + 1.6 * uBeat);
+  // veins: ridged noise, thin bright lines that crawl over the surface
+  float vn = snoise(vDir * 2.7 + vec3(0.0, uTime * 0.12, uTime * 0.07));
+  float vein = pow(1.0 - abs(vn), 9.0);
+  vec3 veinCol = texture2D(uGradient, vec2(clamp(0.6 + 0.4 * dn, 0.0, 1.0), 0.5)).rgb;
+  col += veinCol * vein * (0.5 + 1.1 * uBass + 0.8 * uBeat);
+
+  // Fresnel rim and a small specular highlight
+  col += mix(uAccent, uPrimary, 0.45) * pow(1.0 - ndv, 3.4) * 2.2;
+  vec3 H = normalize(L + V);
+  col += mix(uAccent, uPrimary, 0.3) * pow(max(dot(N, H), 0.0), 32.0) * 0.5;
 
   gl_FragColor = vec4(col * uBrightness, uOpacity);
   #include <tonemapping_fragment>
@@ -167,12 +176,14 @@ varying vec2 vUv;
 void main() {
   vUv = position.xy * 2.0;
   vec4 mv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+  mv.z -= 0.8; // sits just behind the core
   mv.xy += position.xy * uSize;
   gl_Position = projectionMatrix * mv;
 }`;
 
 const CORONA_FRAGMENT = /* glsl */ `
-uniform sampler2D uGradient;
+uniform vec3 uPrimary;
+uniform vec3 uAccent;
 uniform float uOpacity;
 uniform float uBrightness;
 uniform float uLevel;
@@ -181,10 +192,10 @@ varying vec2 vUv;
 void main() {
   float d = length(vUv);
   float fall = 1.0 - smoothstep(0.0, 1.0, d);
-  float glow = pow(fall, 2.6) * 0.7 + pow(fall, 7.0) * 1.3;
-  vec3 col = texture2D(uGradient, vec2(0.5 + 0.35 * uLevel, 0.5)).rgb;
-  col *= glow * (0.3 + 0.8 * uLevel + 0.5 * uBeat) * uBrightness * uOpacity;
-  gl_FragColor = vec4(col, 1.0);
+  float glow = pow(fall, 2.4);
+  vec3 col = uPrimary * glow * (0.3 + 0.4 * uLevel);
+  col += mix(uAccent, uPrimary, 0.3) * pow(fall, 4.0) * uBeat * 0.35; // inner flash on the beat
+  gl_FragColor = vec4(col * uBrightness * uOpacity, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }`;
@@ -219,10 +230,10 @@ void main() {
   float k = vRing;
   float dir = mod(k, 2.0) < 0.5 ? 1.0 : -1.0;
   // comet-like dashes running around the ring: bright head, long tail
-  float seg = fract(vUv.x * (3.0 + k) + uTime * dir * (0.07 + 0.04 * k));
-  float comet = pow(seg, 4.0);
+  float seg = fract(vUv.x * (3.0 + k) - uTime * dir * (0.07 + 0.04 * k));
+  float comet = pow(seg, 10.0) + 0.3 * pow(seg, 1.6);
   vec3 col = texture2D(uGradient, vec2(0.4 + 0.15 * k + 0.35 * comet, 0.5)).rgb;
-  col *= (0.1 + 0.9 * comet) * (0.5 + 1.8 * uMid + 0.8 * uBeat);
+  col *= (0.08 + comet) * (0.5 + 1.8 * uMid + 0.8 * uBeat);
   // never draw close to the listener's head
   col *= smoothstep(0.8, 1.9, distance(vWorld, cameraPosition));
   gl_FragColor = vec4(col * uBrightness * uOpacity, 1.0);
@@ -252,7 +263,6 @@ void main() {
 }`;
 
 const SHOCK_FRAGMENT = /* glsl */ `
-uniform sampler2D uGradient;
 uniform vec3 uAccent;
 uniform float uOpacity;
 uniform float uBrightness;
@@ -262,14 +272,13 @@ varying float vAge;
 varying float vPower;
 varying vec3 vWorld;
 void main() {
-  float t = (1.0 - vRho) / 0.5;      // 0 at the leading edge .. 1 at the inner edge
   float d = (1.0 - vRho) * vScale;   // metres behind the leading edge
-  float trail = smoothstep(0.0, 0.05, d) * exp(-d * 3.2) * (1.0 - t);
-  float ed = (d - 0.07) / 0.045;
-  float edge = exp(-ed * ed);
-  float life = pow(clamp(1.0 - vAge, 0.0, 1.0), 1.6);
-  vec3 tint = texture2D(uGradient, vec2(0.65 + 0.25 * (1.0 - vAge), 0.5)).rgb;
-  vec3 col = tint * trail * 1.3 + mix(uAccent, vec3(1.0), 0.5) * edge * 1.6;
+  // thin (~8 cm) bright ring at the leading edge + a faint wake
+  float ed = (d - 0.05) / 0.035;
+  float ring = exp(-ed * ed);
+  float wake = smoothstep(0.0, 0.06, d) * exp(-d * 2.2) * 0.12;
+  float life = pow(clamp(1.0 - vAge, 0.0, 1.0), 1.3);
+  vec3 col = uAccent * (ring * 2.6 + wake);
   col *= life * vPower * uBrightness * uOpacity * smoothstep(0.8, 2.0, distance(vWorld, cameraPosition));
   gl_FragColor = vec4(col, 1.0);
   #include <tonemapping_fragment>
@@ -437,6 +446,7 @@ export class PulseCore implements Preset {
   private shockU!: Record<string, THREE.IUniform>;
   private swarmU!: Record<string, THREE.IUniform>;
   private disposables: { dispose(): void }[] = [];
+  private allUniforms: Record<string, THREE.IUniform>[] = [];
 
   private time = 0;
   private orbit = 0;
@@ -455,6 +465,8 @@ export class PulseCore implements Preset {
     const shared = () => ({
       uGradient: { value: palette.gradient },
       uAccent: { value: palette.accent },
+      uPrimary: { value: palette.primary },
+      uBackground: { value: palette.background },
       uTime: { value: 0 },
       uLevel: { value: 0 },
       uBeat: { value: 0 },
@@ -478,7 +490,7 @@ export class PulseCore implements Preset {
     this.core.renderOrder = 0;
 
     // --- corona ---
-    this.coronaU = { ...shared(), uSize: { value: 3.4 } };
+    this.coronaU = { ...shared(), uSize: { value: 6 } };
     const coronaGeo = new THREE.PlaneGeometry(1, 1);
     const coronaMat = new THREE.ShaderMaterial({
       uniforms: this.coronaU,
@@ -495,7 +507,7 @@ export class PulseCore implements Preset {
 
     // --- orbit rings ---
     this.ringU = { ...shared(), uMid: { value: 0 } };
-    const ringGeo = new THREE.TorusGeometry(1, 0.009, 6, 220);
+    const ringGeo = new THREE.TorusGeometry(1, 0.0055, 6, 220);
     ringGeo.setAttribute('aRing', new THREE.InstancedBufferAttribute(new Float32Array([0, 1, 2]), 1));
     const ringMat = new THREE.ShaderMaterial({
       uniforms: this.ringU,
@@ -553,7 +565,8 @@ export class PulseCore implements Preset {
     swarm.renderOrder = 3;
 
     this.group.add(this.core, corona, this.rings, this.shock, swarm);
-    this.disposables.push(coreGeo, coreMat, coronaGeo, coronaMat, ringGeo, ringMat, shockGeo, shockMat, swarmGeo, swarmMat);
+    this.allUniforms = [this.coreU, this.coronaU, this.ringU, this.shockU, this.swarmU];
+    this.disposables.push(coreGeo, coreMat, coronaGeo, coronaMat, ringGeo, ringMat, shockGeo, shockMat, swarmGeo, swarmMat, this.rings, this.shock);
     this.updateRings();
   }
 
@@ -568,7 +581,7 @@ export class PulseCore implements Preset {
     const bright = 0.6 + 0.4 * p.glow;
     this.orbit += dt * p.speed * (0.35 + 1.8 * Math.min(1, f.highMid * p.intensity));
 
-    for (const u of [this.coreU, this.coronaU, this.ringU, this.shockU, this.swarmU]) {
+    for (const u of this.allUniforms) {
       u.uTime.value = this.time;
       u.uLevel.value = level;
       u.uBeat.value = beat;
@@ -577,7 +590,7 @@ export class PulseCore implements Preset {
     this.coreU.uBass.value = bass;
     this.coreU.uMid.value = mid;
     this.coreU.uTreble.value = treble;
-    this.coronaU.uSize.value = 3.4 + 1.4 * level + 0.9 * beat;
+    this.coronaU.uSize.value = 6 + 0.8 * level + 0.5 * beat;
     this.ringU.uMid.value = Math.min(1, mid);
     this.swarmU.uOrbit.value = this.orbit;
     this.swarmU.uBass.value = Math.min(1, bass);
@@ -592,7 +605,7 @@ export class PulseCore implements Preset {
   }
 
   setOpacity(o: number): void {
-    for (const u of [this.coreU, this.coronaU, this.ringU, this.shockU, this.swarmU]) u.uOpacity.value = o;
+    for (const u of this.allUniforms) u.uOpacity.value = o;
   }
 
   dispose(): void {

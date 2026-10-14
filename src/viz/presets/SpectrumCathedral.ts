@@ -265,7 +265,7 @@ export class SpectrumCathedral implements Preset {
       m.frustumCulled = false; // placement happens entirely in the vertex shader
       this.group.add(m);
       this.meshes.push(m);
-      this.disposables.push(m.geometry, m.material as THREE.Material);
+      this.disposables.push(m.geometry, m.material as THREE.Material, m);
     }
     halo.renderOrder = 1;
   }

@@ -13,6 +13,7 @@ import { MicSource } from './sources/MicSource';
 import { DemoSource } from './sources/DemoSource';
 import { YouTubePlayer, type YtState } from './youtube/YouTubePlayer';
 import { isMixList, parseYouTube, youtubeThumbnail, type YouTubeRef } from './youtube/parse';
+import { PlayOrder } from './queue/PlayOrder';
 import { isAudioFile, metaFromUrl, parseFileName, readId3 } from './trackInfo';
 
 type Mode = 'element' | 'youtube' | 'demo';
@@ -55,12 +56,13 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
   private live = false;
   private token = 0;
   private errorStreak = 0;
+  /** tracks whose proxy stream failed: they fall back to the YouTube player + microphone */
+  private readonly proxyFailed = new Set<string>();
   private lastNow = 0;
   private timeAcc = 0;
   private zeroed = false;
   private hintTimer = 0;
-  private readonly history: string[] = [];
-  private readonly played = new Set<string>();
+  private readonly order = new PlayOrder();
   private readonly objectUrls = new Map<string, string>();
 
   constructor(opts: { proxyUrl?: string } = {}) {
@@ -183,7 +185,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
 
   private analysisFor(s: PlaybackState): AnalysisInput {
     const t = s.track;
-    const ytViaMic = t?.kind === 'youtube' && !this.proxyUrl;
+    const ytViaMic = t?.kind === 'youtube' && !this.proxiedStream(t);
     if (s.micEnabled && (this.micExplicit || ytViaMic)) return 'mic';
     return t && !ytViaMic ? 'element' : 'none';
   }
@@ -324,6 +326,11 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
 
   private streamUrl(id: string): string { return `${this.proxyUrl}/stream?v=${id}`; }
 
+  /** True when this YouTube track plays through the proxy (otherwise: IFrame player + microphone) */
+  private proxiedStream(t: Track): boolean {
+    return t.kind === 'youtube' && this.proxyUrl !== '' && !this.proxyFailed.has(t.id);
+  }
+
   /** Fill in real titles via oEmbed (4 at a time); the player's own title wins once the video is loaded */
   private enrichYouTube(tracks: Track[]): void {
     const todo = tracks.slice();
@@ -358,8 +365,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     this.token++;
     this.stopOutputs();
     for (const id of [...this.objectUrls.keys()]) this.revoke(id);
-    this.history.length = 0;
-    this.played.clear();
+    this.order.clear();
     this.set({ queue: [], index: -1, track: null, playing: false, currentTime: 0, duration: 0, message: undefined, status: 'idle' });
     this.dispatchEvent(new Event('trackchange'));
   }
@@ -380,12 +386,13 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
       if (!pb.queue.length) return;
       return this.startTrack(pb.shuffle ? Math.floor(Math.random() * pb.queue.length) : 0);
     }
-    // resume the loaded track
+    // resume the loaded track (local playback ends live-microphone mode)
     try {
       if (this.mode === 'youtube') {
         this.yt.play();
         return;
       }
+      if (this.micExplicit) this.disableMic();
       await this.resume();
       if (this.mode === 'demo') { this.demoSource().start(); this.set({ playing: true }); }
       else if (this.mode === 'element') { await this.element.play(); this.set({ playing: true }); }
@@ -410,7 +417,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
   async next(): Promise<void> {
     const n = this.pickNext(false);
     if (n < 0) return;
-    this.pushHistory();
+    this.order.remember(this.pb.track?.id);
     await this.startTrack(n);
   }
 
@@ -420,7 +427,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     if (pb.currentTime > 3) { this.seek(0); return; }
     let target = -1;
     if (pb.shuffle) {
-      const id = this.history.pop();
+      const id = this.order.back();
       target = pb.queue.findIndex((t) => t.id === id);
     } else if (pb.index > 0) {
       target = pb.index - 1;
@@ -435,7 +442,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     const pb = this.pb;
     if (!pb.track || !Number.isFinite(seconds)) return;
     const s = Math.max(0, pb.duration > 0 ? Math.min(seconds, pb.duration) : seconds);
-    if (this.mode === 'element') this.element.seek(s);
+    if (this.mode === 'element') { if (!this.element.seek(s)) return; }
     else if (this.mode === 'youtube') this.yt.seek(s);
     else return;
     this.set({ currentTime: s });
@@ -454,45 +461,22 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
   }
 
   setShuffle(on: boolean): void {
-    this.played.clear();
-    if (this.pb.track) this.played.add(this.pb.track.id);
+    this.order.restartCycle(this.pb.track?.id);
     this.set({ shuffle: on });
   }
 
   setRepeat(mode: PlaybackState['repeat']): void { this.set({ repeat: mode }); }
 
-  private pushHistory(): void {
-    if (this.pb.track) this.history.push(this.pb.track.id);
-    if (this.history.length > 200) this.history.shift();
-  }
-
-  /** Index of the track that follows the current one, or -1. `auto` = natural end of a track. */
   private pickNext(auto: boolean): number {
     const { queue, index, repeat, shuffle } = this.pb;
-    const n = queue.length;
-    if (!n) return -1;
-    if (auto && repeat === 'one' && index >= 0) return index;
-    if (shuffle) {
-      let pool: number[] = [];
-      for (let i = 0; i < n; i++) if (i !== index && !this.played.has(queue[i].id)) pool.push(i);
-      if (!pool.length) {
-        if (auto && repeat !== 'all') return -1;
-        this.played.clear();
-        if (queue[index]) this.played.add(queue[index].id);
-        pool = [];
-        for (let i = 0; i < n; i++) if (n === 1 || i !== index) pool.push(i);
-      }
-      return pool[Math.floor(Math.random() * pool.length)];
-    }
-    if (index + 1 < n) return index + 1;
-    return auto && repeat !== 'all' ? -1 : 0;
+    return this.order.next(queue, index, repeat, shuffle, auto);
   }
 
   private onTrackEnded(): void {
     this.dispatchEvent(new Event('ended'));
     const n = this.pickNext(true);
     if (n >= 0) {
-      this.pushHistory();
+      this.order.remember(this.pb.track?.id);
       void this.startTrack(n);
       return;
     }
@@ -503,6 +487,14 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
   /** Fatal problem with the current source: show it and skip ahead when there is somewhere to go */
   private onSourceError(message: string): void {
     if (this.pb.status === 'error' && this.pb.message === message) return; // play() rejection + media 'error' event
+    const t = this.pb.track;
+    if (t && this.mode === 'element' && this.proxiedStream(t)) {
+      // proxy unreachable or yt-dlp failed: use the YouTube player (analysed through the microphone) instead
+      this.proxyFailed.add(t.id);
+      this.report('YouTube proxy failed, using the YouTube player and microphone instead.');
+      void this.startTrack(this.pb.index);
+      return;
+    }
     this.set({ playing: false });
     this.report(message, 'error');
     const token = this.token;
@@ -511,12 +503,14 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     }
   }
 
-  private stopOutputs(): void {
+  /** Silence every output. The mic stays open only when it was opened on purpose or `keepMic` (YouTube → YouTube). */
+  private stopOutputs(keepMic = false): void {
     this.mode = null;
     window.clearTimeout(this.hintTimer);
     this.element.unload();
     this.yt.stop();
     this.demo?.stop();
+    if (!keepMic && !this.micExplicit && this.mic.isOpen) this.disableMic();
   }
 
   // --------------------------------------------------------------------------------------------- track start
@@ -524,15 +518,15 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     const track = this.pb.queue[index];
     if (!track) return;
     const token = ++this.token;
-    this.stopOutputs();
-    this.played.add(track.id);
+    this.stopOutputs(true);
+    this.order.markPlayed(track.id);
     this.extractor.resetBeat();
     this.set({
       index, track, status: 'loading', message: undefined, playing: false, currentTime: 0, duration: track.duration ?? 0,
     });
     this.dispatchEvent(new Event('trackchange'));
 
-    const proxied = track.kind === 'youtube' && this.proxyUrl !== '';
+    const proxied = this.proxiedStream(track);
     try {
       if (track.kind === 'mic') {
         await this.enableMic();
@@ -540,6 +534,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
         return;
       }
       if (track.kind === 'youtube' && !proxied) {
+        if (!track.youtubeId) throw new Error('This YouTube track has no video id.');
         await this.startYouTube(track, token);
         return;
       }
@@ -617,7 +612,8 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
     try {
       const r = await fetch(`${this.proxyUrl}/info?v=${track.youtubeId}`);
       if (!r.ok) return;
-      const info = (await r.json()) as { title?: string; duration?: number; uploader?: string };
+      const info = (await r.json()) as { title?: string; duration?: number; uploader?: string; seekable?: boolean };
+      if (info.seekable === false && token === this.token) this.element.setSeekable(false);
       if (info.duration && info.duration > 0) {
         this.element.setKnownDuration(info.duration);
         if (token === this.token) this.set({ duration: info.duration });
@@ -691,6 +687,7 @@ export class AudioEngine extends EventTarget implements AudioEngineApi {
 
   setProxyUrl(url: string): void {
     this.proxyUrl = normalizeProxy(url);
+    this.proxyFailed.clear();
     this.set({ proxyConfigured: this.proxyUrl !== '' });
   }
 

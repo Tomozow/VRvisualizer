@@ -323,7 +323,7 @@ export function drawSeekIcon(ctx: CanvasRenderingContext2D, dir: -1 | 1, cx: num
   ctx.closePath();
   ctx.fill();
   ctx.restore();
-  drawText(ctx, '10', cx, cy + size * 0.015, size * 0.34, color, { weight: 800, align: 'center', baseline: 'middle' });
+  drawText(ctx, '10', cx, cy + size * 0.015, Math.max(36, size * 0.375), color, { weight: 800, align: 'center', baseline: 'middle' });
 }
 
 // ---------------------------------------------------------------------------------------------

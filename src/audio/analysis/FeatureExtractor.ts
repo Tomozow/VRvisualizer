@@ -4,7 +4,9 @@ import { BAND_COUNT, WAVE_COUNT, type AudioFeatures } from '../types';
  * Pure signal analysis: turns one frame of analyser data (`features.freq` / `features.wave`, filled by the
  * caller) into every other field of `AudioFeatures`. No Web Audio dependency, nothing is allocated per frame.
  *
- * Analyser byte data is linear in dB over [DB_MIN, DB_MAX]; all thresholds below are expressed on that 0..1 scale.
+ * Analyser byte data is linear in dB (the engine configures -100 dB .. -10 dB), so most thresholds below are
+ * expressed on that 0..1 scale. Spectrum: noise gate → tilt → AGC → contrast curve → fast-attack / slow-release.
+ * Beats: rise events in the bass band, tempo from an inter-beat histogram, phase-locked grid (see detectBeat).
  */
 
 const FFT_BINS = 1024;
@@ -30,9 +32,9 @@ const ENERGY_TAU = 2;           // s
 
 // ---- beat detection ---------------------------------------------------------------------------------------------
 const BASS_REF_FLOOR = 0.002;   // linear amplitude (≈ -54 dB): quieter bass is not amplified to full scale
-const RISE_POWER = 0.5;
+const RISE_POWER = 0.5;         // sqrt-compress the normalised bass amplitude before taking its rise
 const RISE_TAU = 0.07;          // s, follower used to turn the bass level into a "rise" signal
-const BASS_K = 1.25;            // event threshold = mean + max(K·σ, MIN) on the rise signal
+const BASS_K = 1.75;            // event threshold = mean + max(K·σ, MIN) on the rise signal
 const BASS_MIN = 0.07;          // ≈ 6 dB rise on the byte scale
 const FLUX_K = 2.2;
 const FLUX_MIN = 0.22;
@@ -270,10 +272,10 @@ export class FeatureExtractor {
 
   // ---------------------------------------------------------------------------------------------------------------
   /**
-   * Beat tracking in three layers: (1) onset events on the rise of the 40–180 Hz level (spectral-flux events as a
-   * fallback for bass-less material), (2) tempo from an inter-beat-interval histogram, (3) once a tempo is known a
-   * phase-locked beat grid that rejects off-grid events (e.g. off-beat bass notes) unless they are consistently
-   * stronger than the on-grid ones, in which case the grid slides onto them.
+   * Beat tracking in three layers: (1) onset events on the rise of the 40–180 Hz amplitude (spectral-flux events as
+   * a fallback for bass-less material), (2) tempo from an inter-beat-interval histogram, (3) once a tempo is known,
+   * a beat grid that follows the phase carrying the most event energy. Events off the grid (e.g. off-beat bass
+   * notes) are not reported as beats unless they are about as strong as the on-grid ones.
    */
   private detectBeat(dt: number, silent: boolean): void {
     const f = this.f;
@@ -305,7 +307,8 @@ export class FeatureExtractor {
     }
     if (be === 2) this.endEvent(this.bass.peak);
 
-    if (f.bpm > 0 && now - this.lastBeat > Math.max(3, 8 * 60 / f.bpm)) this.resetTempo(); // no beat for ~8 periods: forget the tempo
+    // no beat for ~8 periods: forget the tempo
+    if (f.bpm > 0 && now - this.lastBeat > Math.max(3, 8 * 60 / f.bpm)) this.resetTempo();
 
     f.beatPhase = 0;
     if (f.bpm > 0) {

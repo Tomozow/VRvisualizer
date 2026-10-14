@@ -93,7 +93,9 @@ export class Environment {
           vec2 g = abs(fract(p * 0.5 - 0.5) - 0.5) / fwidth(p * 0.5);
           float line = 1.0 - min(min(g.x, g.y), 1.0);
           // radial rings travelling outward on beats
-          float ring = smoothstep(0.08, 0.0, abs(fract(r * 0.18 - uTime * 0.25) - 0.5) - 0.42) * uBeat;
+          // thin rings (band width ≈ 0.08 in fract space); smoothstep edges must be ascending or the result is undefined
+          float ringD = abs(fract(r * 0.18 - uTime * 0.25) - 0.5) - 0.42;
+          float ring = (1.0 - smoothstep(0.0, 0.08, ringD)) * step(0.0, ringD) * uBeat * 0.6;
           float fade = exp(-r * 0.09);
           vec3 col = uColor * line * 0.35 + uColor2 * ring * 0.8 + uColor * 0.03 * uBass;
           gl_FragColor = vec4(col * fade, 1.0) * uOpacity;
