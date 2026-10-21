@@ -1,7 +1,11 @@
 # Resonance VR
 
+[日本語](README_JP.md)
+
 Immersive music visualizer & player for **Meta Quest 2** (and any WebXR browser), built with three.js + WebXR + TypeScript.
 No backend required — it is a static site.
+
+![Screenshot](docs/screenshot.png)
 
 | | |
 |---|---|
